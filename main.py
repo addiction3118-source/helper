@@ -1,3 +1,19 @@
+"""
+Telegram-бот для мониторинга фриланс-бирж под ЧИСТЫЙ вайбкодинг.
+Парсит RSS бирж, через ИИ фильтрует/оценивает заказы, шлёт карточки с
+кнопками: промпт-отклик (3 варианта), оценка цены/времени, избранное, 👍/👎.
+
+Фичи: скоринг 1-10, фильтр по сложности и бюджету, обучение на 👍/👎,
+команды управления из чата, сводка за день, тихие часы, дедуп дублей,
+русские и английские биржи, мониторинг ключевых тегов.
+
+Секреты — в .env. Установка: pip install -r requirements.txt
+Запуск: python main.py  (или кнопка ▷ в VS Code)
+
+ВАЖНО про Render free: диск временный, при передеплое seen.db обнуляется
+(избранное/обучение/настройки сбросятся). Для постоянного хранения — Postgres.
+"""
+
 import os
 import re
 import json
@@ -376,8 +392,8 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
         else:
             raw = await _call_openai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
     except Exception as e:
-        log.warning("ИИ-анализ недоступен: %s", e)
-        return "medium", 5
+        log.warning("ИИ-анализ недоступен, заказ пропускаю (не оценён): %s", e)
+        return "no", 0      # не смогли оценить → не шлём, чтобы не было мусора
     txt = raw.strip().strip("`")
     txt = re.sub(r"^json", "", txt, flags=re.IGNORECASE).strip()
     try:
@@ -450,6 +466,9 @@ async def _call_openai(session, system, user_msg, max_tokens):
     async with session.post("https://api.openai.com/v1/chat/completions", headers=headers,
                             json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
         data = await resp.json()
+    if "choices" not in data:
+        # показываем реальную причину (нет ключа / нет квоты / не та модель)
+        raise RuntimeError(f"OpenAI вернул ошибку: {data.get('error', data)}")
     return data["choices"][0]["message"]["content"].strip()
 
 
