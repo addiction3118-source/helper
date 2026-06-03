@@ -1,4 +1,3 @@
-
 import os
 import re
 import asyncio
@@ -39,6 +38,12 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # ИИ-фильтрация: true — ИИ финально решает, подходит ли заказ
 USE_AI_FILTER = os.getenv("USE_AI_FILTER", "true").strip().lower() == "true"
+
+# Максимальная сложность заказов, которые присылать: easy / medium / hard
+# easy   — только 🟢 лёгкие (чистый вайбкодинг)
+# medium — 🟢 лёгкие + 🟡 средние
+# hard   — все подходящие
+MAX_DIFFICULTY = os.getenv("MAX_DIFFICULTY", "easy").strip().lower()
 
 # Прокси для Telegram (если VPN не помогает). Пусто = без прокси.
 # Примеры: http://127.0.0.1:8080  |  socks5://127.0.0.1:1080 (нужен aiohttp_socks)
@@ -104,6 +109,7 @@ class Job:
     link: str
     description: str
     budget: str = ""
+    difficulty: str = ""      # метка сложности от ИИ
 
     @property
     def uid(self) -> str:
@@ -204,35 +210,65 @@ async def is_suitable(session: aiohttp.ClientSession, job: Job) -> bool:
     keyword_ok = any(good in text for good in WHITELIST)
 
     if not USE_AI_FILTER:
+        if keyword_ok:
+            job.difficulty = "🟢 Похоже на вайбкодинг"   # грубая оценка без ИИ
         return keyword_ok
 
     # 3) если совсем мимо по словам — ИИ не дёргаем
     if not keyword_ok:
         return False
 
-    # 4) финальное решение принимает ИИ
-    return await ai_is_suitable(session, job)
+    # 4) ИИ за один запрос: подходит ли + насколько сложно
+    label = await ai_classify(session, job)
+    if label == "НЕТ":
+        return False
+    # отсекаем заказы сложнее заданного порога
+    rank = {"ЛЁГКАЯ": 1, "СРЕДНЯЯ": 2, "СЛОЖНАЯ": 3}
+    allowed = {"easy": 1, "medium": 2, "hard": 3}.get(MAX_DIFFICULTY, 1)
+    if rank.get(label, 3) > allowed:
+        return False
+    job.difficulty = DIFFICULTY_LABELS.get(label, "")
+    return True
 
 
 FILTER_SYSTEM = (
     "Ты фильтр заказов для фрилансера-вайбкодера (быстро собирает сайты, "
     "Telegram-ботов, парсеры, автоматизации, ИИ-интеграции, no-code решения "
-    "с помощью ИИ). Оцени, подходит ли заказ под такой профиль. "
-    "Ответь СТРОГО одним словом: ДА или НЕТ."
+    "с помощью ИИ-инструментов). Оцени заказ и ответь СТРОГО одним словом:\n"
+    "ЛЁГКАЯ — собирается за вечер чистым вайбкодингом;\n"
+    "СРЕДНЯЯ — вайбкодинг плюс ручная доработка;\n"
+    "СЛОЖНАЯ — нужна серьёзная ручная разработка;\n"
+    "НЕТ — заказ вообще не про вайбкодинг (дизайн, видео, тексты и т.п.).\n"
+    "Никаких пояснений, только одно слово."
 )
 
+DIFFICULTY_LABELS = {
+    "ЛЁГКАЯ": "🟢 Лёгкая — хватит вайбкодинга",
+    "СРЕДНЯЯ": "🟡 Средняя — вайбкодинг + доработка",
+    "СЛОЖНАЯ": "🔴 Сложная — нужна ручная разработка",
+}
 
-async def ai_is_suitable(session: aiohttp.ClientSession, job: Job) -> bool:
+
+async def ai_classify(session: aiohttp.ClientSession, job: Job) -> str:
+    """Возвращает ЛЁГКАЯ / СРЕДНЯЯ / СЛОЖНАЯ / НЕТ."""
     msg = f"Заголовок: {job.title}\nОписание: {job.description[:800]}"
     try:
         if AI_PROVIDER == "anthropic":
-            ans = await _call_anthropic(session, FILTER_SYSTEM, msg, max_tokens=5)
+            ans = await _call_anthropic(session, FILTER_SYSTEM, msg, max_tokens=10)
         else:
-            ans = await _call_openai(session, FILTER_SYSTEM, msg, max_tokens=5)
+            ans = await _call_openai(session, FILTER_SYSTEM, msg, max_tokens=10)
     except Exception as e:
-        log.warning("ИИ-фильтр недоступен, пропускаю по ключевым словам: %s", e)
-        return True   # не теряем заказ из-за сбоя ИИ
-    return "да" in ans.strip().lower()
+        log.warning("ИИ-фильтр недоступен, пропускаю по словам: %s", e)
+        return "СРЕДНЯЯ"   # не теряем заказ из-за сбоя ИИ
+
+    a = ans.strip().lower().replace("ё", "е")
+    if "нет" in a:
+        return "НЕТ"
+    if "легк" in a:
+        return "ЛЁГКАЯ"
+    if "сложн" in a:
+        return "СЛОЖНАЯ"
+    return "СРЕДНЯЯ"
 
 
 # ============================================================
@@ -320,6 +356,8 @@ job_cache: dict[str, Job] = {}   # ключ -> Job для callback-кнопок
 
 def build_card(job: Job) -> tuple[str, InlineKeyboardMarkup]:
     text = f"🆕 <b>{html.escape(job.title)}</b>\n📍 {job.source}\n"
+    if job.difficulty:
+        text += f"⚙️ {job.difficulty}\n"
     if job.budget:
         text += f"💰 {html.escape(job.budget)}\n"
     if job.description:
