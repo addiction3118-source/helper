@@ -1,0 +1,4 @@
+.env
+seen.db
+__pycache__/
+.vscode/

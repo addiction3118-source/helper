@@ -1,0 +1,5 @@
+aiogram
+aiohttp
+feedparser
+python-dotenv
+aiohttp_socks
