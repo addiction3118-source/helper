@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import aiohttp
+from aiohttp import web
 import feedparser
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -436,15 +437,28 @@ def check_config():
         raise SystemExit(1)
 
 
+async def start_health_server():
+    """Мини HTTP-сервер: Render видит открытый порт, пинговалка его дёргает,
+    чтобы бесплатный Web Service не засыпал. Локально просто висит на 10000."""
+    port = int(os.getenv("PORT", "10000"))
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="bot alive"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    log.info("Health-сервер слушает порт %s", port)
+
+
 async def main():
     check_config()
     db_init()
+    await start_health_server()              # для Render Web Service + пинговалки
     await ensure_connection()
     asyncio.create_task(poller())            # фоновый мониторинг
     while True:                              # авто-перезапуск polling при сбоях сети
         try:
             await dp.start_polling(bot, handle_signals=False)
-        except Exception as e:pip install aiohttp_socks
+        except Exception as e:
             log.error("Polling упал (%s). Перезапуск через 10с…", type(e).__name__)
             await asyncio.sleep(10)
 
