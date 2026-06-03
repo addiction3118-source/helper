@@ -1,11 +1,12 @@
 import os
 import re
+import json
 import asyncio
 import logging
 import sqlite3
 import html
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
 
 import aiohttp
 from aiohttp import web
@@ -14,15 +15,12 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from aiogram.filters import Command
 
 # ============================================================
-#               КОНФИГ ИЗ .env (секреты не в коде)
+#                   КОНФИГ ИЗ .env
 # ============================================================
 
 load_dotenv()
@@ -30,62 +28,74 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
-AI_PROVIDER = os.getenv("AI_PROVIDER", "anthropic").strip().lower()
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# ИИ-фильтрация: true — ИИ финально решает, подходит ли заказ
 USE_AI_FILTER = os.getenv("USE_AI_FILTER", "true").strip().lower() == "true"
 
-# Максимальная сложность заказов, которые присылать: easy / medium / hard
-# easy   — только 🟢 лёгкие (чистый вайбкодинг)
-# medium — 🟢 лёгкие + 🟡 средние
-# hard   — все подходящие
-MAX_DIFFICULTY = os.getenv("MAX_DIFFICULTY", "easy").strip().lower()
+# Дефолты (можно менять командами из чата — они переопределяют эти значения)
+MAX_DIFFICULTY = os.getenv("MAX_DIFFICULTY", "easy").strip().lower()   # easy/medium/hard
+MIN_BUDGET = int(os.getenv("MIN_BUDGET", "0"))                          # минимум в ₽, 0 = без фильтра
+STAR_THRESHOLD = int(os.getenv("STAR_THRESHOLD", "8"))                  # с какого скора ставить ⭐
 
-# Прокси для Telegram (если VPN не помогает). Пусто = без прокси.
-# Примеры: http://127.0.0.1:8080  |  socks5://127.0.0.1:1080 (нужен aiohttp_socks)
+# Английские биржи (заказы в валюте). true — включить
+ENABLE_ENGLISH = os.getenv("ENABLE_ENGLISH", "false").strip().lower() == "true"
+
+# Тихие часы (по локальному времени): ночью копим, утром шлём пачкой. start==end = выкл
+QUIET_START = int(os.getenv("QUIET_START", "23"))
+QUIET_END = int(os.getenv("QUIET_END", "8"))
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "2"))     # смещение от UTC (Варшава летом = +2)
+DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "9")) # час утренней сводки (локальный)
+
+# Ключевые теги — заказы с ними помечаются 🔔 (через запятую)
+WATCH_KEYWORDS = [w.strip().lower() for w in os.getenv("WATCH_KEYWORDS", "").split(",") if w.strip()]
+
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))   # секунды
-
 # ============================================================
-#                   ИСТОЧНИКИ (биржи с откликами)
+#                   ИСТОЧНИКИ (биржи)
 # ============================================================
 
 SOURCES = [
+    # --- русские биржи с откликами ---
     {"name": "Habr Freelance", "enabled": True,
      "url": "https://freelance.habr.com/tasks.rss"},
-    {"name": "Weblancer",      "enabled": True,
+    {"name": "Weblancer", "enabled": True,
      "url": "https://www.weblancer.net/rss/projects/"},
-    {"name": "FL.ru",          "enabled": True,
+    {"name": "FL.ru", "enabled": True,
      "url": "https://www.fl.ru/rss/all.xml"},
-    {"name": "Freelance.ru",   "enabled": True,
+    {"name": "Freelance.ru", "enabled": True,
      "url": "https://freelance.ru/rss/projects"},
+    # --- английские биржи (включаются флагом ENABLE_ENGLISH) ---
+    {"name": "Freelancer.com", "enabled": ENABLE_ENGLISH,
+     "url": "https://www.freelancer.com/rss.xml"},
+    {"name": "RemoteOK", "enabled": ENABLE_ENGLISH,
+     "url": "https://remoteok.com/remote-dev-jobs.rss"},
     # Upwork: вставь свой RSS из сохранённого поиска и поставь enabled True
-    {"name": "Upwork",         "enabled": False,
+    {"name": "Upwork", "enabled": False,
      "url": "https://www.upwork.com/ab/feed/jobs/rss?q=..."},
+    # Kwork: открытого RSS нет, нужен HTML-парсинг с риском капчи — выключено
 ]
 
 # ============================================================
-#                       ФИЛЬТРЫ
+#                   ФИЛЬТРЫ (грубый предотбор)
 # ============================================================
 
-# Грубый предфильтр (чтобы зря не дёргать ИИ).
 WHITELIST = [
-    "лендинг", "landing", "сайт", "бот", "bot", "telegram", "автоматизац",
-    "парсер", "парсинг", "scrap", "no-code", "no code", "ноукод",
-    "интеграц", "api", "скрипт", "script", "чат-бот", "chatbot",
-    "ai", "gpt", "нейросет", "автоматизировать", "веб-приложен",
-    "web app", "виджет", "форма", "google sheets", "таблиц", "дашборд",
+    "лендинг", "landing", "сайт", "site", "бот", "bot", "telegram", "автоматизац",
+    "парсер", "парсинг", "scrap", "no-code", "no code", "ноукод", "интеграц",
+    "api", "скрипт", "script", "чат-бот", "chatbot", "ai", "gpt", "нейросет",
+    "автоматизировать", "веб-приложен", "web app", "виджет", "форма", "form",
+    "google sheets", "таблиц", "дашборд", "dashboard", "automation", "website",
 ]
-# Жёсткий чёрный список — сразу мимо.
 BLACKLIST = [
-    "дизайн", "логотип", "smm", "видеомонтаж", "видео", "монтаж",
-    "копирайт", "рерайт", "перевод текст", "озвучк", "иллюстрац",
-    "анимац", "3d", "моделирование", "верстальщик", "наполнение",
+    "дизайн", "логотип", "logo", "smm", "видеомонтаж", "видео", "монтаж",
+    "копирайт", "рерайт", "перевод текст", "озвучк", "иллюстрац", "анимац",
+    "3d", "моделирование", "верстальщик", "наполнение", "seo-текст",
 ]
 
 DB_PATH = "seen.db"
@@ -99,7 +109,7 @@ log = logging.getLogger("freelance-bot")
 
 
 # ============================================================
-#                          МОДЕЛИ
+#                          МОДЕЛЬ
 # ============================================================
 
 @dataclass
@@ -109,43 +119,167 @@ class Job:
     link: str
     description: str
     budget: str = ""
-    difficulty: str = ""      # метка сложности от ИИ
+    difficulty: str = ""
+    score: int = 0
+    watched: bool = False
 
     @property
     def uid(self) -> str:
         return f"{self.source}::{self.link}"
 
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+    @staticmethod
+    def from_dict(d: dict) -> "Job":
+        return Job(**{k: d[k] for k in (
+            "source", "title", "link", "description", "budget",
+            "difficulty", "score", "watched") if k in d})
+
 
 # ============================================================
-#                     БАЗА (дедупликация)
+#                          БАЗА
 # ============================================================
 
 def db_init():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS seen (uid TEXT PRIMARY KEY, ts TEXT)")
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS seen (uid TEXT PRIMARY KEY, title_key TEXT, ts TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS prefs (word TEXT PRIMARY KEY, w INTEGER)")
+    c.execute("CREATE TABLE IF NOT EXISTS favorites (uid TEXT PRIMARY KEY, data TEXT, ts TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS jobs_log (uid TEXT PRIMARY KEY, title TEXT, link TEXT, score INTEGER, source TEXT, ts TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS pending (uid TEXT PRIMARY KEY, data TEXT)")
     conn.commit()
     conn.close()
 
 
-def is_seen(uid: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT 1 FROM seen WHERE uid=?", (uid,)).fetchone()
+def _conn():
+    return sqlite3.connect(DB_PATH)
+
+
+def title_key(title: str) -> str:
+    """Нормализованный ключ заголовка для отлова дублей с разных бирж."""
+    return re.sub(r"[^a-zа-яё0-9]", "", title.lower())[:80]
+
+
+def is_seen(uid: str, t_key: str) -> bool:
+    conn = _conn()
+    row = conn.execute(
+        "SELECT 1 FROM seen WHERE uid=? OR (title_key=? AND title_key!='')",
+        (uid, t_key),
+    ).fetchone()
     conn.close()
     return row is not None
 
 
-def mark_seen(uid: str):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT OR IGNORE INTO seen (uid, ts) VALUES (?, ?)",
-        (uid, datetime.now(timezone.utc).isoformat()),
-    )
+def mark_seen(uid: str, t_key: str):
+    conn = _conn()
+    conn.execute("INSERT OR IGNORE INTO seen (uid, title_key, ts) VALUES (?,?,?)",
+                 (uid, t_key, datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
 
 
+def get_setting(key: str, default):
+    conn = _conn()
+    row = conn.execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value):
+    conn = _conn()
+    conn.execute("INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)", (key, str(value)))
+    conn.commit()
+    conn.close()
+
+
+# эффективные настройки (команды из чата переопределяют .env)
+def eff_min_budget() -> int:
+    return int(get_setting("min_budget", MIN_BUDGET))
+
+
+def eff_max_difficulty() -> str:
+    return str(get_setting("max_difficulty", MAX_DIFFICULTY))
+
+
+def is_paused() -> bool:
+    return get_setting("paused", "0") == "1"
+
+
+def add_favorite(job: Job):
+    conn = _conn()
+    conn.execute("INSERT OR REPLACE INTO favorites (uid, data, ts) VALUES (?,?,?)",
+                 (job.uid, json.dumps(job.to_dict(), ensure_ascii=False),
+                  datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def list_favorites() -> list[Job]:
+    conn = _conn()
+    rows = conn.execute("SELECT data FROM favorites ORDER BY ts DESC LIMIT 20").fetchall()
+    conn.close()
+    return [Job.from_dict(json.loads(r[0])) for r in rows]
+
+
+def log_job(job: Job):
+    conn = _conn()
+    conn.execute("INSERT OR REPLACE INTO jobs_log (uid, title, link, score, source, ts) "
+                 "VALUES (?,?,?,?,?,?)",
+                 (job.uid, job.title, job.link, job.score, job.source,
+                  datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def jobs_last_24h() -> list[tuple]:
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT title, link, score, source FROM jobs_log WHERE ts > ? ORDER BY score DESC",
+        (since,)).fetchall()
+    conn.close()
+    return rows
+
+
+def queue_pending(job: Job):
+    conn = _conn()
+    conn.execute("INSERT OR REPLACE INTO pending (uid, data) VALUES (?,?)",
+                 (job.uid, json.dumps(job.to_dict(), ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
+
+def pop_pending() -> list[Job]:
+    conn = _conn()
+    rows = conn.execute("SELECT data FROM pending").fetchall()
+    conn.execute("DELETE FROM pending")
+    conn.commit()
+    conn.close()
+    return [Job.from_dict(json.loads(r[0])) for r in rows]
+
+
 # ============================================================
-#                     ПАРСИНГ ИСТОЧНИКОВ
+#                   ВРЕМЯ / ТИХИЕ ЧАСЫ
+# ============================================================
+
+def now_local() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET)
+
+
+def in_quiet_hours() -> bool:
+    if QUIET_START == QUIET_END:
+        return False
+    h = now_local().hour
+    if QUIET_START < QUIET_END:
+        return QUIET_START <= h < QUIET_END
+    return h >= QUIET_START or h < QUIET_END   # период через полночь
+
+
+# ============================================================
+#                   ПАРСИНГ ИСТОЧНИКОВ
 # ============================================================
 
 def _strip_tags(s: str) -> str:
@@ -160,7 +294,6 @@ def _strip_tags(s: str) -> str:
     return "".join(out).strip()
 
 
-# Ищем сумму в тексте: "5000 руб", "от 10 000 ₽", "$500", "300 руб/час" и т.п.
 _BUDGET_RE = re.compile(
     r"(?:от\s*|до\s*|~\s*)?\d[\d\s.,]*\s*"
     r"(?:руб|рублей|₽|р\.|rub|usd|\$|€|eur|грн)"
@@ -172,6 +305,20 @@ _BUDGET_RE = re.compile(
 def extract_budget(text: str) -> str:
     m = _BUDGET_RE.search(text)
     return re.sub(r"\s+", " ", m.group(0)).strip() if m else ""
+
+
+def budget_to_number(budget: str) -> int:
+    """Грубо вытаскиваем число. $/€ приблизительно переводим в ₽ (×90)."""
+    if not budget:
+        return 0
+    chunk = budget.split("/")[0]
+    digits = re.sub(r"[^\d]", "", chunk)
+    if not digits:
+        return 0
+    val = int(digits)
+    if "$" in budget or "usd" in budget.lower() or "€" in budget or "eur" in budget.lower():
+        val *= 90
+    return val
 
 
 async def fetch_source(session: aiohttp.ClientSession, src: dict) -> list[Job]:
@@ -188,7 +335,7 @@ async def fetch_source(session: aiohttp.ClientSession, src: dict) -> list[Job]:
         title = html.unescape(getattr(entry, "title", "")).strip()
         link = getattr(entry, "link", "").strip()
         desc = _strip_tags(html.unescape(getattr(entry, "summary", "")))
-        budget = extract_budget(f"{title} {desc}")   # вытаскиваем сумму, если есть
+        budget = extract_budget(f"{title} {desc}")
         if link:
             jobs.append(Job(source=src["name"], title=title, link=link,
                             description=desc, budget=budget))
@@ -196,240 +343,364 @@ async def fetch_source(session: aiohttp.ClientSession, src: dict) -> list[Job]:
 
 
 # ============================================================
-#                     ФИЛЬТРАЦИЯ (слова + ИИ)
+#                   ИИ: анализ + генерация
 # ============================================================
 
-async def is_suitable(session: aiohttp.ClientSession, job: Job) -> bool:
-    text = f"{job.title} {job.description}".lower()
-
-    # 1) жёсткий чёрный список — мимо
-    if any(bad in text for bad in BLACKLIST):
-        return False
-
-    # 2) грубый предфильтр по ключевым словам (экономим токены ИИ)
-    keyword_ok = any(good in text for good in WHITELIST)
-
-    if not USE_AI_FILTER:
-        if keyword_ok:
-            job.difficulty = "🟢 Похоже на вайбкодинг"   # грубая оценка без ИИ
-        return keyword_ok
-
-    # 3) если совсем мимо по словам — ИИ не дёргаем
-    if not keyword_ok:
-        return False
-
-    # 4) ИИ за один запрос: подходит ли + насколько сложно
-    label = await ai_classify(session, job)
-    if label == "НЕТ":
-        return False
-    # отсекаем заказы сложнее заданного порога
-    rank = {"ЛЁГКАЯ": 1, "СРЕДНЯЯ": 2, "СЛОЖНАЯ": 3}
-    allowed = {"easy": 1, "medium": 2, "hard": 3}.get(MAX_DIFFICULTY, 1)
-    if rank.get(label, 3) > allowed:
-        return False
-    job.difficulty = DIFFICULTY_LABELS.get(label, "")
-    return True
-
-
-FILTER_SYSTEM = (
-    "Ты фильтр заказов для фрилансера-вайбкодера (быстро собирает сайты, "
-    "Telegram-ботов, парсеры, автоматизации, ИИ-интеграции, no-code решения "
-    "с помощью ИИ-инструментов). Оцени заказ и ответь СТРОГО одним словом:\n"
-    "ЛЁГКАЯ — собирается за вечер чистым вайбкодингом;\n"
-    "СРЕДНЯЯ — вайбкодинг плюс ручная доработка;\n"
-    "СЛОЖНАЯ — нужна серьёзная ручная разработка;\n"
-    "НЕТ — заказ вообще не про вайбкодинг (дизайн, видео, тексты и т.п.).\n"
-    "Никаких пояснений, только одно слово."
+ANALYZE_SYSTEM = (
+    "Ты анализируешь заказ для фрилансера, который хочет ТОЛЬКО вайбкодить — "
+    "быстро собирать решения с помощью ИИ-инструментов (сайты, Telegram-боты, "
+    "парсеры, автоматизации, no-code, ИИ-интеграции), без тяжёлой ручной "
+    "разработки. Верни СТРОГО JSON без пояснений и без markdown:\n"
+    '{"fit": "easy|medium|hard|no", "score": число от 1 до 10}\n'
+    "fit: easy — собирается за вечер чистым вайбкодингом; medium — вайбкодинг + "
+    "ручная доработка; hard — нужна серьёзная ручная разработка; no — заказ "
+    "вообще не про код (дизайн, видео, тексты).\n"
+    "score: насколько заказ хорош ИМЕННО для чистого вайбкодинга и выгоден "
+    "(10 — идеально простой и денежный, 1 — почти не подходит)."
 )
 
 DIFFICULTY_LABELS = {
-    "ЛЁГКАЯ": "🟢 Лёгкая — хватит вайбкодинга",
-    "СРЕДНЯЯ": "🟡 Средняя — вайбкодинг + доработка",
-    "СЛОЖНАЯ": "🔴 Сложная — нужна ручная разработка",
+    "easy": "🟢 Лёгкая — хватит вайбкодинга",
+    "medium": "🟡 Средняя — вайбкодинг + доработка",
+    "hard": "🔴 Сложная — нужна ручная разработка",
 }
+RANK = {"easy": 1, "medium": 2, "hard": 3}
 
 
-async def ai_classify(session: aiohttp.ClientSession, job: Job) -> str:
-    """Возвращает ЛЁГКАЯ / СРЕДНЯЯ / СЛОЖНАЯ / НЕТ."""
-    msg = f"Заголовок: {job.title}\nОписание: {job.description[:800]}"
+async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int]:
+    msg = (f"Заголовок: {job.title}\nОписание: {job.description[:800]}\n"
+           f"Бюджет: {job.budget or 'не указан'}")
     try:
         if AI_PROVIDER == "anthropic":
-            ans = await _call_anthropic(session, FILTER_SYSTEM, msg, max_tokens=10)
+            raw = await _call_anthropic(session, ANALYZE_SYSTEM, msg, max_tokens=40)
         else:
-            ans = await _call_openai(session, FILTER_SYSTEM, msg, max_tokens=10)
+            raw = await _call_openai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
     except Exception as e:
-        log.warning("ИИ-фильтр недоступен, пропускаю по словам: %s", e)
-        return "СРЕДНЯЯ"   # не теряем заказ из-за сбоя ИИ
+        log.warning("ИИ-анализ недоступен: %s", e)
+        return "medium", 5
+    txt = raw.strip().strip("`")
+    txt = re.sub(r"^json", "", txt, flags=re.IGNORECASE).strip()
+    try:
+        data = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+        fit = str(data.get("fit", "medium")).lower()
+        score = int(data.get("score", 5))
+    except Exception:
+        fit, score = "medium", 5
+    if fit not in ("easy", "medium", "hard", "no"):
+        fit = "medium"
+    return fit, max(1, min(10, score))
 
-    a = ans.strip().lower().replace("ё", "е")
-    if "нет" in a:
-        return "НЕТ"
-    if "легк" in a:
-        return "ЛЁГКАЯ"
-    if "сложн" in a:
-        return "СЛОЖНАЯ"
-    return "СРЕДНЯЯ"
-
-
-# ============================================================
-#                   ГЕНЕРАЦИЯ ОТКЛИКА (ИИ)
-# ============================================================
 
 REPLY_SYSTEM = (
-    "Ты помогаешь фрилансеру-вайбкодеру писать короткие цепляющие отклики на "
-    "заказы. Пиши на русском, по делу, 4-6 предложений: поздоровайся, покажи "
-    "что понял задачу, предложи конкретный подход/стек, упомяни сроки и "
-    "предложи обсудить детали. Без воды и канцелярита."
+    "Ты помогаешь фрилансеру-вайбкодеру писать отклики на заказы. "
+    "Напиши ТРИ варианта на русском, разделённые строкой '---'. "
+    "Вариант 1 — короткий и деловой (3-4 предложения). "
+    "Вариант 2 — подробный, с конкретным подходом и стеком. "
+    "Вариант 3 — лёгкий, неформальный. В каждом: понимание задачи, подход, "
+    "сроки, призыв обсудить. Без воды и канцелярита. Не нумеруй заголовки."
+)
+
+PRICE_SYSTEM = (
+    "Ты оцениваешь заказ для вайбкодера. Кратко (3-5 строк) дай: "
+    "справедливую вилку цены в рублях, примерные часы работы и 1-2 риска/нюанса. "
+    "Без воды, по делу."
 )
 
 
-async def generate_reply(session: aiohttp.ClientSession, job: Job) -> str:
-    msg = (
-        f"Заказ с биржи {job.source}.\n"
-        f"Заголовок: {job.title}\n"
-        f"Описание: {job.description[:1500]}\n\n"
-        f"Напиши отклик от моего лица."
-    )
+async def generate_reply(session, job: Job) -> str:
+    msg = (f"Заказ с биржи {job.source}.\nЗаголовок: {job.title}\n"
+           f"Описание: {job.description[:1500]}\n\nНапиши три варианта отклика.")
     try:
         if AI_PROVIDER == "anthropic":
-            return await _call_anthropic(session, REPLY_SYSTEM, msg, max_tokens=600)
-        return await _call_openai(session, REPLY_SYSTEM, msg, max_tokens=600)
+            return await _call_anthropic(session, REPLY_SYSTEM, msg, max_tokens=900)
+        return await _call_openai(session, REPLY_SYSTEM, msg, max_tokens=900)
     except Exception as e:
         log.error("Ошибка ИИ: %s", e)
-        return "⚠️ Не удалось сгенерировать отклик. Проверь API-ключ/лимиты."
+        return "⚠️ Не удалось сгенерировать отклик. Проверь ключ/лимиты."
 
 
-async def _call_anthropic(session, system: str, user_msg: str, max_tokens: int) -> str:
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": [{"role": "user", "content": user_msg}],
-    }
-    async with session.post(
-        "https://api.anthropic.com/v1/messages", headers=headers, json=payload,
-        timeout=aiohttp.ClientTimeout(total=60),
-    ) as resp:
+async def estimate_price(session, job: Job) -> str:
+    msg = (f"Заголовок: {job.title}\nОписание: {job.description[:1200]}\n"
+           f"Указанный бюджет: {job.budget or 'не указан'}")
+    try:
+        if AI_PROVIDER == "anthropic":
+            return await _call_anthropic(session, PRICE_SYSTEM, msg, max_tokens=300)
+        return await _call_openai(session, PRICE_SYSTEM, msg, max_tokens=300)
+    except Exception as e:
+        log.error("Ошибка ИИ: %s", e)
+        return "⚠️ Не удалось оценить заказ."
+
+
+async def _call_anthropic(session, system, user_msg, max_tokens):
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    payload = {"model": ANTHROPIC_MODEL, "max_tokens": max_tokens, "system": system,
+               "messages": [{"role": "user", "content": user_msg}]}
+    async with session.post("https://api.anthropic.com/v1/messages", headers=headers,
+                            json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
         data = await resp.json()
     return "".join(b.get("text", "") for b in data.get("content", [])).strip()
 
 
-async def _call_openai(session, system: str, user_msg: str, max_tokens: int) -> str:
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_msg},
-        ],
-    }
-    async with session.post(
-        "https://api.openai.com/v1/chat/completions", headers=headers, json=payload,
-        timeout=aiohttp.ClientTimeout(total=60),
-    ) as resp:
+async def _call_openai(session, system, user_msg, max_tokens):
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": OPENAI_MODEL, "max_tokens": max_tokens,
+               "messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": user_msg}]}
+    async with session.post("https://api.openai.com/v1/chat/completions", headers=headers,
+                            json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
         data = await resp.json()
     return data["choices"][0]["message"]["content"].strip()
 
 
 # ============================================================
-#                         TELEGRAM
+#                   ФИЛЬТРАЦИЯ ЗАКАЗА
 # ============================================================
 
-# Сессия с прокси (если задан) и увеличенным таймаутом — против WinError 121
+async def evaluate(session, job: Job) -> bool:
+    """Решает, слать ли заказ. Заполняет job.difficulty, job.score, job.watched."""
+    text = f"{job.title} {job.description}".lower()
+
+    if any(bad in text for bad in BLACKLIST):
+        return False
+    keyword_ok = any(good in text for good in WHITELIST)
+
+    if USE_AI_FILTER:
+        if not keyword_ok:                # грубый предотбор экономит токены
+            return False
+        fit, score = await ai_analyze(session, job)
+    else:
+        fit, score = ("easy" if keyword_ok else "no"), 5
+
+    if fit == "no":
+        return False
+    if RANK.get(fit, 3) > RANK.get(eff_max_difficulty(), 1):
+        return False
+
+    # фильтр по бюджету (если он указан и ниже порога — мимо; неизвестный не режем)
+    bv = budget_to_number(job.budget)
+    min_b = eff_min_budget()
+    if bv and min_b and bv < min_b:
+        return False
+
+    score = max(1, min(10, score))
+    job.difficulty = DIFFICULTY_LABELS.get(fit, "")
+    job.score = score
+    job.watched = any(w in text for w in WATCH_KEYWORDS)
+    return True
+
+
+# ============================================================
+#                          TELEGRAM
+# ============================================================
+
 _session = AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else AiohttpSession()
 _session.timeout = 60
-
 bot = Bot(token=BOT_TOKEN, session=_session)
 dp = Dispatcher()
 
-job_cache: dict[str, Job] = {}   # ключ -> Job для callback-кнопок
+job_cache: dict[str, Job] = {}
+
+
+def _key(job: Job) -> str:
+    k = str(abs(hash(job.uid)) % (10**12))
+    job_cache[k] = job
+    return k
+
+
+def stars(score: int) -> str:
+    return "⭐" if score >= STAR_THRESHOLD else ""
 
 
 def build_card(job: Job) -> tuple[str, InlineKeyboardMarkup]:
-    text = f"🆕 <b>{html.escape(job.title)}</b>\n📍 {job.source}\n"
+    bell = "🔔 " if job.watched else ""
+    text = f"{bell}🆕 <b>{html.escape(job.title)}</b> {stars(job.score)}\n"
+    text += f"📍 {job.source}   📈 Скор: {job.score}/10\n"
     if job.difficulty:
         text += f"⚙️ {job.difficulty}\n"
     if job.budget:
         text += f"💰 {html.escape(job.budget)}\n"
     if job.description:
-        text += f"\n{html.escape(job.description[:300])}…\n"
+        text += f"\n{html.escape(job.description[:280])}…\n"
     text += f"\n🔗 {job.link}"
 
-    key = str(abs(hash(job.uid)) % (10**12))   # короткий ключ (лимит 64 байта)
-    job_cache[key] = job
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔗 Открыть", url=job.link),
-        InlineKeyboardButton(text="✍️ Промпт", callback_data=f"reply:{key}"),
-    ]])
+    k = _key(job)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Открыть", url=job.link),
+         InlineKeyboardButton(text="✍️ Промпт", callback_data=f"reply:{k}")],
+        [InlineKeyboardButton(text="📊 Оценить", callback_data=f"price:{k}"),
+         InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav:{k}")],
+    ])
     return text, kb
 
 
-@dp.callback_query(F.data.startswith("reply:"))
-async def on_reply(cb: CallbackQuery):
-    job = job_cache.get(cb.data.split(":", 1)[1])
-    if not job:
-        await cb.answer("Заказ устарел, перезапусти поиск", show_alert=True)
-        return
-    await cb.answer("Генерирую отклик…")
-    async with aiohttp.ClientSession() as session:
-        reply = await generate_reply(session, job)
-    await cb.message.answer(
-        f"✍️ <b>Отклик для «{html.escape(job.title)}»</b>\n\n{html.escape(reply)}",
-        parse_mode="HTML",
-    )
+async def send_card(job: Job):
+    text, kb = build_card(job)
+    try:
+        await bot.send_message(CHAT_ID, text, reply_markup=kb,
+                               parse_mode="HTML", disable_web_page_preview=False)
+        await asyncio.sleep(0.4)
+    except Exception as e:
+        log.error("Ошибка отправки: %s", e)
 
+
+def _get_job(cb: CallbackQuery) -> Job | None:
+    return job_cache.get(cb.data.split(":", 1)[1])
+
+
+@dp.callback_query(F.data.startswith("reply:"))
+async def cb_reply(cb: CallbackQuery):
+    job = _get_job(cb)
+    if not job:
+        await cb.answer("Заказ устарел", show_alert=True); return
+    await cb.answer("Генерирую 3 варианта…")
+    async with aiohttp.ClientSession() as s:
+        reply = await generate_reply(s, job)
+    await cb.message.answer(f"✍️ <b>Отклики для «{html.escape(job.title)}»</b>\n\n"
+                            f"{html.escape(reply)}", parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("price:"))
+async def cb_price(cb: CallbackQuery):
+    job = _get_job(cb)
+    if not job:
+        await cb.answer("Заказ устарел", show_alert=True); return
+    await cb.answer("Оцениваю…")
+    async with aiohttp.ClientSession() as s:
+        est = await estimate_price(s, job)
+    await cb.message.answer(f"📊 <b>Оценка заказа</b>\n\n{html.escape(est)}",
+                            parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("fav:"))
+async def cb_fav(cb: CallbackQuery):
+    job = _get_job(cb)
+    if not job:
+        await cb.answer("Заказ устарел", show_alert=True); return
+    add_favorite(job)
+    await cb.answer("Добавлено в избранное ⭐")
+
+
+# -------------------- команды --------------------
 
 @dp.message(Command("start"))
-async def on_start(msg: Message):
+async def cmd_start(msg: Message):
     await msg.answer(
-        "Привет! Мониторю фриланс-биржи и шлю подходящие под вайбкодинг заказы. "
-        "По каждому — кнопка «✍️ Промпт».\n\n/check — проверить сейчас"
+        "Привет! Мониторю фриланс-биржи и шлю заказы под чистый вайбкодинг.\n\n"
+        "Команды:\n"
+        "/check — проверить сейчас\n"
+        "/filter — показать настройки\n"
+        "/budget 5000 — мин. бюджет в ₽ (0 = без фильтра)\n"
+        "/difficulty easy|medium|hard — макс. сложность\n"
+        "/favorites — избранное\n"
+        "/digest — сводка за 24 часа\n"
+        "/pause /resume — пауза/возобновить"
     )
 
 
 @dp.message(Command("check"))
-async def on_check(msg: Message):
+async def cmd_check(msg: Message):
     await msg.answer("Проверяю биржи…")
     n = await run_scan()
     await msg.answer(f"Готово. Новых подходящих: {n}")
 
 
+@dp.message(Command("filter"))
+async def cmd_filter(msg: Message):
+    await msg.answer(
+        "⚙️ <b>Текущие настройки</b>\n"
+        f"Макс. сложность: {eff_max_difficulty()}\n"
+        f"Мин. бюджет: {eff_min_budget()} ₽\n"
+        f"ИИ-фильтр: {'вкл' if USE_AI_FILTER else 'выкл'}\n"
+        f"Английские биржи: {'вкл' if ENABLE_ENGLISH else 'выкл'}\n"
+        f"Тихие часы: {QUIET_START}:00–{QUIET_END}:00\n"
+        f"Пауза: {'да' if is_paused() else 'нет'}",
+        parse_mode="HTML")
+
+
+@dp.message(Command("budget"))
+async def cmd_budget(msg: Message):
+    parts = msg.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await msg.answer("Использование: /budget 5000"); return
+    set_setting("min_budget", int(parts[1]))
+    await msg.answer(f"Мин. бюджет установлен: {parts[1]} ₽")
+
+
+@dp.message(Command("difficulty"))
+async def cmd_difficulty(msg: Message):
+    parts = msg.text.split()
+    if len(parts) < 2 or parts[1].lower() not in ("easy", "medium", "hard"):
+        await msg.answer("Использование: /difficulty easy|medium|hard"); return
+    set_setting("max_difficulty", parts[1].lower())
+    await msg.answer(f"Макс. сложность: {parts[1].lower()}")
+
+
+@dp.message(Command("pause"))
+async def cmd_pause(msg: Message):
+    set_setting("paused", "1")
+    await msg.answer("⏸ Мониторинг на паузе. /resume чтобы продолжить.")
+
+
+@dp.message(Command("resume"))
+async def cmd_resume(msg: Message):
+    set_setting("paused", "0")
+    await msg.answer("▶️ Мониторинг возобновлён.")
+
+
+@dp.message(Command("favorites"))
+async def cmd_favorites(msg: Message):
+    favs = list_favorites()
+    if not favs:
+        await msg.answer("В избранном пока пусто."); return
+    text = "⭐ <b>Избранное</b>\n\n" + "\n\n".join(
+        f"• <b>{html.escape(j.title)}</b>\n{j.link}" for j in favs)
+    await msg.answer(text[:4000], parse_mode="HTML", disable_web_page_preview=True)
+
+
+@dp.message(Command("digest"))
+async def cmd_digest(msg: Message):
+    await send_digest(force=True)
+
+
+async def send_digest(force: bool = False):
+    rows = jobs_last_24h()
+    if not rows:
+        if force:
+            await bot.send_message(CHAT_ID, "За последние 24 часа подходящих заказов не было.")
+        return
+    top = rows[:5]
+    text = f"📋 <b>Сводка за 24 часа</b>\nВсего подходящих: {len(rows)}\n\nТоп:\n"
+    text += "\n".join(f"{stars(s)} {sc}/10 — <a href='{lnk}'>{html.escape(t)}</a> ({src})"
+                      for t, lnk, sc, src in top)
+    await bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
+
+
 # ============================================================
-#                        ОСНОВНОЙ ЦИКЛ
+#                       ЦИКЛЫ
 # ============================================================
 
 async def run_scan() -> int:
+    if is_paused():
+        return 0
     found = 0
     async with aiohttp.ClientSession() as session:
         for src in SOURCES:
             if not src.get("enabled"):
                 continue
             for job in await fetch_source(session, src):
-                if is_seen(job.uid):
+                tk = title_key(job.title)
+                if is_seen(job.uid, tk):
                     continue
-                mark_seen(job.uid)
-                if not await is_suitable(session, job):
+                mark_seen(job.uid, tk)
+                if not await evaluate(session, job):
                     continue
-                text, kb = build_card(job)
-                try:
-                    await bot.send_message(
-                        CHAT_ID, text, reply_markup=kb,
-                        parse_mode="HTML", disable_web_page_preview=False,
-                    )
-                    found += 1
-                    await asyncio.sleep(0.5)   # анти-флуд
-                except Exception as e:
-                    log.error("Ошибка отправки: %s", e)
+                log_job(job)
+                if in_quiet_hours():
+                    queue_pending(job)       # ночью копим
+                else:
+                    await send_card(job)
+                found += 1
     return found
 
 
@@ -438,14 +709,46 @@ async def poller():
         try:
             n = await run_scan()
             if n:
-                log.info("Отправлено новых заказов: %s", n)
+                log.info("Новых заказов: %s", n)
         except Exception as e:
             log.error("Ошибка сканирования: %s", e)
         await asyncio.sleep(POLL_INTERVAL)
 
 
+async def quiet_flush_loop():
+    """Когда тихие часы закончились — отправляем накопленное пачкой."""
+    while True:
+        await asyncio.sleep(60)
+        if not in_quiet_hours():
+            pend = pop_pending()
+            if pend:
+                await bot.send_message(CHAT_ID, f"☀️ За ночь накопилось заказов: {len(pend)}")
+                for job in sorted(pend, key=lambda j: j.score, reverse=True):
+                    await send_card(job)
+
+
+async def digest_loop():
+    """Раз в день в DIGEST_HOUR шлём утреннюю сводку."""
+    while True:
+        await asyncio.sleep(60)
+        if now_local().hour == DIGEST_HOUR:
+            today = now_local().date().isoformat()
+            if get_setting("last_digest", "") != today:
+                set_setting("last_digest", today)
+                await send_digest()
+
+
+async def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="bot alive"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    log.info("Health-сервер слушает порт %s", port)
+
+
 async def ensure_connection():
-    """Ждём связь с Telegram, не падаем на WinError 121 / таймауте."""
     attempt = 0
     while True:
         attempt += 1
@@ -475,25 +778,15 @@ def check_config():
         raise SystemExit(1)
 
 
-async def start_health_server():
-    """Мини HTTP-сервер: Render видит открытый порт, пинговалка его дёргает,
-    чтобы бесплатный Web Service не засыпал. Локально просто висит на 10000."""
-    port = int(os.getenv("PORT", "10000"))
-    app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="bot alive"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", port).start()
-    log.info("Health-сервер слушает порт %s", port)
-
-
 async def main():
     check_config()
     db_init()
-    await start_health_server()              # для Render Web Service + пинговалки
+    await start_health_server()
     await ensure_connection()
-    asyncio.create_task(poller())            # фоновый мониторинг
-    while True:                              # авто-перезапуск polling при сбоях сети
+    asyncio.create_task(poller())
+    asyncio.create_task(quiet_flush_loop())
+    asyncio.create_task(digest_loop())
+    while True:
         try:
             await dp.start_polling(bot, handle_signals=False)
         except Exception as e:
