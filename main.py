@@ -82,11 +82,17 @@ SOURCES = [
      "url": "https://freelance.ru/rss/projects"},
     {"name": "Workspace", "enabled": True,
      "url": "https://workspace.ru/tenders/rss/"},
+    {"name": "Habr Карьера", "enabled": True,
+     "url": "https://career.habr.com/vacancies/rss"},
     # --- английские биржи (включаются флагом ENABLE_ENGLISH) ---
     {"name": "Freelancer.com", "enabled": ENABLE_ENGLISH,
      "url": "https://www.freelancer.com/rss.xml"},
     {"name": "RemoteOK", "enabled": ENABLE_ENGLISH,
      "url": "https://remoteok.com/remote-dev-jobs.rss"},
+    {"name": "WeWorkRemotely", "enabled": ENABLE_ENGLISH,
+     "url": "https://weworkremotely.com/categories/remote-programming-jobs.rss"},
+    {"name": "Jobicy", "enabled": ENABLE_ENGLISH,
+     "url": "https://jobicy.com/?feed=job_feed&job_categories=dev"},
     # Upwork: вставь свой RSS из сохранённого поиска и поставь enabled True
     {"name": "Upwork", "enabled": False,
      "url": "https://www.upwork.com/ab/feed/jobs/rss?q=..."},
@@ -1049,6 +1055,10 @@ def check_config():
         problems.append("ANTHROPIC_API_KEY пуст")
     if AI_PROVIDER == "openai" and not OPENAI_API_KEY:
         problems.append("OPENAI_API_KEY пуст")
+    if AI_PROVIDER == "groq" and not GROQ_API_KEY:
+        problems.append("GROQ_API_KEY пуст")
+    if AI_PROVIDER == "gemini" and not GEMINI_API_KEY:
+        problems.append("GEMINI_API_KEY пуст")
     if problems:
         log.error("Проверь .env: %s", "; ".join(problems))
         raise SystemExit(1)
@@ -1059,12 +1069,25 @@ async def main():
     db_init()
     await start_health_server()
     await ensure_connection()
+
+    # На бесплатном Render деплой не zero-downtime: старый экземпляр ещё
+    # держит getUpdates, пока стартует новый. Сбрасываем вебхук и копим
+    # обновления заново, а небольшая пауза даёт старому процессу умереть —
+    # так конфликтов при старте меньше.
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        log.warning("Не удалось сбросить вебхук: %s", e)
+    log.info("Жду 15с, чтобы старый экземпляр освободил соединение…")
+    await asyncio.sleep(15)
+
     asyncio.create_task(poller())
     asyncio.create_task(quiet_flush_loop())
     asyncio.create_task(digest_loop())
     while True:
         try:
-            await dp.start_polling(bot, handle_signals=False)
+            await dp.start_polling(bot, handle_signals=False,
+                                   drop_pending_updates=True)
         except Exception as e:
             log.error("Polling упал (%s). Перезапуск через 10с…", type(e).__name__)
             await asyncio.sleep(10)
