@@ -5,6 +5,9 @@ import asyncio
 import logging
 import sqlite3
 import html
+import imaplib
+import email
+from email.header import decode_header
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 
@@ -45,7 +48,7 @@ USE_AI_FILTER = os.getenv("USE_AI_FILTER", "true").strip().lower() == "true"
 
 # Дефолты (можно менять командами из чата — они переопределяют эти значения)
 MAX_DIFFICULTY = os.getenv("MAX_DIFFICULTY", "easy").strip().lower()   # easy/medium/hard
-MIN_BUDGET = int(os.getenv("MIN_BUDGET", "0"))                          # минимум в ₽, 0 = без фильтра
+MIN_BUDGET = int(os.getenv("MIN_BUDGET", "1000"))                       # минимум в ₽, 0 = без фильтра
 STAR_THRESHOLD = int(os.getenv("STAR_THRESHOLD", "8"))                  # с какого скора ставить ⭐
 
 # Английские биржи (заказы в валюте). true — включить
@@ -66,6 +69,16 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
 AI_DELAY = int(os.getenv("AI_DELAY", "13"))   # пауза между запросами к ИИ
 
+# --- Kwork через почту (Gmail IMAP) ---
+# Заведи в Kwork подписку на нужные категории — он будет слать письма о новых
+# проектах. Бот читает их из почты. Нужен app password Gmail (не основной пароль).
+KWORK_EMAIL_ENABLED = os.getenv("KWORK_EMAIL_ENABLED", "false").strip().lower() == "true"
+IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com").strip()
+IMAP_USER = os.getenv("IMAP_USER", "").strip()
+IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "").strip()   # app password
+# От какого адреса приходят письма Kwork (по нему фильтруем входящие)
+KWORK_FROM = os.getenv("KWORK_FROM", "kwork.ru").strip().lower()
+
 # ============================================================
 #                   ИСТОЧНИКИ (биржи)
 # ============================================================
@@ -74,24 +87,27 @@ SOURCES = [
     # --- русские биржи с откликами ---
     {"name": "Habr Freelance", "enabled": True,
      "url": "https://freelance.habr.com/tasks.rss"},
-    {"name": "Weblancer", "enabled": True,
+    # Weblancer / FL.ru отключены — отклики платные (нужен PRO)
+    {"name": "Weblancer", "enabled": False,
      "url": "https://www.weblancer.net/rss/projects/"},
-    {"name": "FL.ru", "enabled": True,
+    {"name": "FL.ru", "enabled": False,
      "url": "https://www.fl.ru/rss/all.xml"},
+    # Freelance.ru оставлен — фильтр заказов можно настроить через почтовые подписки
     {"name": "Freelance.ru", "enabled": True,
      "url": "https://freelance.ru/rss/projects"},
     {"name": "Workspace", "enabled": True,
      "url": "https://workspace.ru/tenders/rss/"},
     {"name": "Habr Карьера", "enabled": True,
      "url": "https://career.habr.com/vacancies/rss"},
-    # --- английские биржи (включаются флагом ENABLE_ENGLISH) ---
-    {"name": "Freelancer.com", "enabled": ENABLE_ENGLISH,
+    # --- английские биржи (включены всегда, язык не важен) ---
+    # Freelancer.com отключён — требует верификацию телефона
+    {"name": "Freelancer.com", "enabled": False,
      "url": "https://www.freelancer.com/rss.xml"},
-    {"name": "RemoteOK", "enabled": ENABLE_ENGLISH,
+    {"name": "RemoteOK", "enabled": True,
      "url": "https://remoteok.com/remote-dev-jobs.rss"},
-    {"name": "WeWorkRemotely", "enabled": ENABLE_ENGLISH,
+    {"name": "WeWorkRemotely", "enabled": True,
      "url": "https://weworkremotely.com/categories/remote-programming-jobs.rss"},
-    {"name": "Jobicy", "enabled": ENABLE_ENGLISH,
+    {"name": "Jobicy", "enabled": True,
      "url": "https://jobicy.com/?feed=job_feed&job_categories=dev"},
     # Upwork: вставь свой RSS из сохранённого поиска и поставь enabled True
     {"name": "Upwork", "enabled": False,
@@ -153,6 +169,7 @@ class Job:
     score: int = 0
     watched: bool = False
     published_at: str = ""   # ISO строка UTC, пустая если RSS не отдал время
+    ru_summary: str = ""     # краткий пересказ/перевод на русский от ИИ
 
     @property
     def uid(self) -> str:
@@ -186,7 +203,8 @@ class Job:
     def from_dict(d: dict) -> "Job":
         return Job(**{k: d[k] for k in (
             "source", "title", "link", "description", "budget",
-            "difficulty", "score", "watched", "published_at") if k in d})
+            "difficulty", "score", "watched", "published_at",
+            "ru_summary") if k in d})
 
 
 # ============================================================
@@ -457,6 +475,115 @@ async def fetch_source(session: aiohttp.ClientSession, src: dict) -> list[Job]:
 
 
 # ============================================================
+#                   KWORK ЧЕРЕЗ ПОЧТУ (IMAP)
+# ============================================================
+
+def _decode_mime(s: str) -> str:
+    """Декодирует MIME-заголовок (=?utf-8?...?=) в нормальную строку."""
+    if not s:
+        return ""
+    parts = []
+    for chunk, enc in decode_header(s):
+        if isinstance(chunk, bytes):
+            try:
+                parts.append(chunk.decode(enc or "utf-8", errors="replace"))
+            except Exception:
+                parts.append(chunk.decode("utf-8", errors="replace"))
+        else:
+            parts.append(chunk)
+    return "".join(parts).strip()
+
+
+def _email_body(msg: email.message.Message) -> str:
+    """Достаёт текст письма: предпочитаем html (там ссылки на проекты)."""
+    html_body, text_body = "", ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            if part.get("Content-Disposition"):
+                continue
+            try:
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                decoded = payload.decode(charset, errors="replace")
+            except Exception:
+                continue
+            if ctype == "text/html":
+                html_body += decoded
+            elif ctype == "text/plain":
+                text_body += decoded
+    else:
+        try:
+            payload = msg.get_payload(decode=True)
+            charset = msg.get_content_charset() or "utf-8"
+            body = payload.decode(charset, errors="replace") if payload else ""
+        except Exception:
+            body = ""
+        if msg.get_content_type() == "text/html":
+            html_body = body
+        else:
+            text_body = body
+    return html_body or text_body
+
+
+# ссылки на проекты Kwork в письме
+_KWORK_LINK_RE = re.compile(r"https?://kwork\.ru/projects/\d+[^\s\"'<>]*", re.IGNORECASE)
+
+
+def _parse_kwork_email(subject: str, body: str) -> list[Job]:
+    """Из одного письма достаём заказы: ссылки на проекты + заголовок."""
+    jobs: list[Job] = []
+    links = list(dict.fromkeys(_KWORK_LINK_RE.findall(body)))  # уникальные, порядок
+    text = _strip_tags(body)
+    text = re.sub(r"\s+", " ", text).strip()
+    # тема письма обычно содержит название проекта
+    title = _decode_mime(subject) or "Заказ с Kwork"
+    budget = extract_budget(f"{title} {text}")
+    for link in links:
+        jobs.append(Job(source="Kwork", title=title, link=link,
+                        description=text[:800], budget=budget,
+                        published_at=datetime.now(timezone.utc).isoformat()))
+    return jobs
+
+
+def _fetch_kwork_blocking() -> list[Job]:
+    """Синхронное чтение непрочитанных писем Kwork по IMAP. Помечает прочитанными."""
+    jobs: list[Job] = []
+    try:
+        imap = imaplib.IMAP4_SSL(IMAP_HOST)
+        imap.login(IMAP_USER, IMAP_PASSWORD)
+        imap.select("INBOX")
+        # только непрочитанные письма от Kwork
+        status, data = imap.search(None, 'UNSEEN', 'FROM', KWORK_FROM)
+        if status != "OK":
+            imap.logout()
+            return jobs
+        ids = data[0].split()
+        for mid in ids:
+            status, msg_data = imap.fetch(mid, "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            subject = msg.get("Subject", "")
+            body = _email_body(msg)
+            jobs.extend(_parse_kwork_email(subject, body))
+            # письмо остаётся прочитанным (UNSEEN снимается автоматически при fetch)
+        imap.logout()
+    except Exception as e:
+        log.warning("Kwork (почта) недоступна: %s", e)
+    return jobs
+
+
+async def fetch_kwork_email() -> list[Job]:
+    """Асинхронная обёртка — IMAP блокирующий, выносим в поток."""
+    if not (KWORK_EMAIL_ENABLED and IMAP_USER and IMAP_PASSWORD):
+        return []
+    return await asyncio.to_thread(_fetch_kwork_blocking)
+
+
+# ============================================================
 #                   ИИ: анализ + генерация
 # ============================================================
 
@@ -465,12 +592,13 @@ ANALYZE_SYSTEM = (
     "быстро собирать решения с помощью ИИ-инструментов (сайты, Telegram-боты, "
     "парсеры, автоматизации, no-code, ИИ-интеграции), без тяжёлой ручной "
     "разработки. Верни СТРОГО JSON без пояснений и без markdown:\n"
-    '{"fit": "easy|medium|hard|no", "score": число от 1 до 10}\n'
+    '{"fit": "easy|medium|hard|no", "score": число от 1 до 10, "ru": "суть заказа на русском, 1-2 предложения"}\n'
     "fit: easy — собирается за вечер чистым вайбкодингом; medium — вайбкодинг + "
     "ручная доработка; hard — нужна серьёзная ручная разработка; no — заказ "
     "вообще не про код (дизайн, видео, тексты).\n"
     "score: насколько заказ хорош ИМЕННО для чистого вайбкодинга и выгоден "
-    "(10 — идеально простой и денежный, 1 — почти не подходит)."
+    "(10 — идеально простой и денежный, 1 — почти не подходит).\n"
+    "ru: коротко перескажи суть заказа на русском (если оригинал на английском — переведи). Максимум 2 предложения."
 )
 
 DIFFICULTY_LABELS = {
@@ -504,7 +632,7 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
     try:
         async with _ai_lock:
             await asyncio.sleep(AI_DELAY)
-            raw = await call_ai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
+            raw = await call_ai(session, ANALYZE_SYSTEM, msg, max_tokens=160)
     except Exception as e:
         msg_e = str(e)
         if "RESOURCE_EXHAUSTED" in msg_e or "429" in msg_e:
@@ -512,7 +640,7 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
                 log.warning("Лимит ключа Gemini — переключился, повторяю запрос…")
                 try:
                     async with _ai_lock:
-                        raw = await call_ai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
+                        raw = await call_ai(session, ANALYZE_SYSTEM, msg, max_tokens=160)
                 except Exception as e2:
                     log.warning("Новый ключ тоже не помог: %s", e2)
                     return "no", 0
@@ -521,7 +649,7 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
                     log.warning("Все ключи Gemini исчерпаны — переключаюсь на Groq…")
                     try:
                         async with _ai_lock:
-                            raw = await _call_groq(session, ANALYZE_SYSTEM, msg, max_tokens=40)
+                            raw = await _call_groq(session, ANALYZE_SYSTEM, msg, max_tokens=160)
                     except Exception as e3:
                         log.warning("Groq тоже не помог: %s", e3)
                         return "no", 0
@@ -539,6 +667,7 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
         data = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
         fit = str(data.get("fit", "medium")).lower()
         score = int(data.get("score", 5))
+        job.ru_summary = str(data.get("ru", "")).strip()[:400]
     except Exception:
         fit, score = "medium", 5
     if fit not in ("easy", "medium", "hard", "no"):
@@ -547,12 +676,19 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
 
 
 REPLY_SYSTEM = (
-    "Ты помогаешь фрилансеру-вайбкодеру писать отклики на заказы. "
-    "Напиши ТРИ варианта на русском, разделённые строкой '---'. "
-    "Вариант 1 — короткий и деловой (3-4 предложения). "
-    "Вариант 2 — подробный, с конкретным подходом и стеком. "
-    "Вариант 3 — лёгкий, неформальный. В каждом: понимание задачи, подход, "
-    "сроки, призыв обсудить. Без воды и канцелярита. Не нумеруй заголовки."
+    "Ты пишешь отклики на фриланс-заказы от лица живого разработчика. "
+    "Пиши как настоящий человек, а не как ИИ. ЗАПРЕЩЕНО: канцелярит, "
+    "шаблонные фразы ('Я внимательно ознакомился', 'Готов взяться за реализацию', "
+    "'В кратчайшие сроки'), восклицания через слово, обороты вроде 'не просто X, "
+    "а Y', тире-перечисления, эмодзи. Пиши живым разговорным языком, как будто "
+    "быстро печатаешь заказчику в личку: простыми короткими предложениями, "
+    "по-человечески, с конкретикой по задаче.\n"
+    "Напиши ТРИ варианта на русском, разделённые строкой '---'.\n"
+    "Вариант 1 — короткий, по делу (2-3 предложения).\n"
+    "Вариант 2 — чуть подробнее: как именно сделаешь, какой стек/инструменты, срок.\n"
+    "Вариант 3 — расслабленный, неформальный, будто пишешь знакомому.\n"
+    "В каждом покажи, что понял задачу, и позови обсудить детали. "
+    "Не используй заголовки и нумерацию внутри вариантов."
 )
 
 PRICE_SYSTEM = (
@@ -743,8 +879,11 @@ def build_card(job: Job) -> tuple[str, InlineKeyboardMarkup]:
         text += f"⚙️ {job.difficulty}\n"
     if job.budget:
         text += f"💰 {html.escape(job.budget)}\n"
+    # перевод/суть на русском от ИИ (если есть)
+    if job.ru_summary:
+        text += f"\n📝 {html.escape(job.ru_summary)}\n"
     if job.description:
-        text += f"\n{html.escape(job.description[:280])}…\n"
+        text += f"\n<i>{html.escape(job.description[:200])}…</i>\n"
     text += f"\n🔗 {job.link}"
 
     k = _key(job)
@@ -953,24 +1092,29 @@ async def run_scan() -> int:
     new_jobs: list[Job] = []
 
     async with aiohttp.ClientSession() as session:
+        # собираем кандидатов: RSS-биржи + Kwork из почты
+        candidates: list[Job] = []
         for src in SOURCES:
             if not src.get("enabled"):
                 continue
-            for job in await fetch_source(session, src):
-                tk = title_key(job.title)
-                if is_seen(job.uid, tk):
-                    continue
-                # пропускаем заказы старше MAX_JOB_AGE_HOURS (если время известно)
-                age = job.age_hours
-                if age is not None and age > MAX_JOB_AGE_HOURS:
-                    continue
-                mark_seen(job.uid, tk)
-                scanned += 1
-                if not await evaluate(session, job):
-                    continue
-                passed += 1
-                log_job(job)
-                new_jobs.append(job)
+            candidates.extend(await fetch_source(session, src))
+        candidates.extend(await fetch_kwork_email())
+
+        for job in candidates:
+            tk = title_key(job.title)
+            if is_seen(job.uid, tk):
+                continue
+            # пропускаем заказы старше MAX_JOB_AGE_HOURS (если время известно)
+            age = job.age_hours
+            if age is not None and age > MAX_JOB_AGE_HOURS:
+                continue
+            mark_seen(job.uid, tk)
+            scanned += 1
+            if not await evaluate(session, job):
+                continue
+            passed += 1
+            log_job(job)
+            new_jobs.append(job)
 
     # сортируем: сначала самые свежие (у кого нет времени — в конец)
     new_jobs.sort(key=lambda j: j.published_at or "", reverse=True)
