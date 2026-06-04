@@ -57,6 +57,7 @@ WATCH_KEYWORDS = [w.strip().lower() for w in os.getenv("WATCH_KEYWORDS", "").spl
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
+AI_DELAY = int(os.getenv("AI_DELAY", "13"))   # пауза между запросами к ИИ
 
 # ============================================================
 #                   ИСТОЧНИКИ (биржи)
@@ -369,14 +370,24 @@ DIFFICULTY_LABELS = {
 RANK = {"easy": 1, "medium": 2, "hard": 3}
 
 
+_ai_lock = asyncio.Lock()   # чтобы запросы к ИИ шли по одному
+
 async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int]:
     msg = (f"Заголовок: {job.title}\nОписание: {job.description[:800]}\n"
            f"Бюджет: {job.budget or 'не указан'}")
     try:
-        raw = await call_ai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
+        async with _ai_lock:
+            await asyncio.sleep(AI_DELAY)          # пауза, чтобы не превысить лимит
+            raw = await call_ai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
     except Exception as e:
-        log.warning("ИИ-анализ недоступен, заказ пропускаю (не оценён): %s", e)
-        return "no", 0      # не смогли оценить → не шлём, чтобы не было мусора
+        msg_e = str(e)
+        if "RESOURCE_EXHAUSTED" in msg_e or "429" in msg_e:
+            log.warning("Лимит Gemini, жду 60с…")
+            await asyncio.sleep(60)                # упёрлись в лимит — ждём минуту
+        else:
+            log.warning("ИИ-анализ недоступен, заказ пропускаю (не оценён): %s", e)
+        return "no", 0
+    
     txt = raw.strip().strip("`")
     txt = re.sub(r"^json", "", txt, flags=re.IGNORECASE).strip()
     try:
