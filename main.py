@@ -44,11 +44,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
-AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower()
+AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").strip().lower()   # gemini / openai / anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 USE_AI_FILTER = os.getenv("USE_AI_FILTER", "true").strip().lower() == "true"
 
@@ -162,7 +164,6 @@ def db_init():
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS seen (uid TEXT PRIMARY KEY, title_key TEXT, ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS prefs (word TEXT PRIMARY KEY, w INTEGER)")
     c.execute("CREATE TABLE IF NOT EXISTS favorites (uid TEXT PRIMARY KEY, data TEXT, ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS jobs_log (uid TEXT PRIMARY KEY, title TEXT, link TEXT, score INTEGER, source TEXT, ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS pending (uid TEXT PRIMARY KEY, data TEXT)")
@@ -387,10 +388,7 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
     msg = (f"Заголовок: {job.title}\nОписание: {job.description[:800]}\n"
            f"Бюджет: {job.budget or 'не указан'}")
     try:
-        if AI_PROVIDER == "anthropic":
-            raw = await _call_anthropic(session, ANALYZE_SYSTEM, msg, max_tokens=40)
-        else:
-            raw = await _call_openai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
+        raw = await call_ai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
     except Exception as e:
         log.warning("ИИ-анализ недоступен, заказ пропускаю (не оценён): %s", e)
         return "no", 0      # не смогли оценить → не шлём, чтобы не было мусора
@@ -427,9 +425,7 @@ async def generate_reply(session, job: Job) -> str:
     msg = (f"Заказ с биржи {job.source}.\nЗаголовок: {job.title}\n"
            f"Описание: {job.description[:1500]}\n\nНапиши три варианта отклика.")
     try:
-        if AI_PROVIDER == "anthropic":
-            return await _call_anthropic(session, REPLY_SYSTEM, msg, max_tokens=900)
-        return await _call_openai(session, REPLY_SYSTEM, msg, max_tokens=900)
+        return await call_ai(session, REPLY_SYSTEM, msg, max_tokens=900)
     except Exception as e:
         log.error("Ошибка ИИ: %s", e)
         return "⚠️ Не удалось сгенерировать отклик. Проверь ключ/лимиты."
@@ -439,9 +435,7 @@ async def estimate_price(session, job: Job) -> str:
     msg = (f"Заголовок: {job.title}\nОписание: {job.description[:1200]}\n"
            f"Указанный бюджет: {job.budget or 'не указан'}")
     try:
-        if AI_PROVIDER == "anthropic":
-            return await _call_anthropic(session, PRICE_SYSTEM, msg, max_tokens=300)
-        return await _call_openai(session, PRICE_SYSTEM, msg, max_tokens=300)
+        return await call_ai(session, PRICE_SYSTEM, msg, max_tokens=300)
     except Exception as e:
         log.error("Ошибка ИИ: %s", e)
         return "⚠️ Не удалось оценить заказ."
@@ -470,6 +464,35 @@ async def _call_openai(session, system, user_msg, max_tokens):
         # показываем реальную причину (нет ключа / нет квоты / не та модель)
         raise RuntimeError(f"OpenAI вернул ошибку: {data.get('error', data)}")
     return data["choices"][0]["message"]["content"].strip()
+
+
+async def _call_gemini(session, system, user_msg, max_tokens):
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    payload = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"parts": [{"text": user_msg}]}],
+        # thinkingBudget=0 выключает «размышления» 2.5-моделей, иначе ответ
+        # может прийти пустым при маленьком лимите токенов
+        "generationConfig": {"maxOutputTokens": max_tokens,
+                             "thinkingConfig": {"thinkingBudget": 0}},
+    }
+    async with session.post(url, json=payload,
+                            timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        data = await resp.json()
+    if "candidates" not in data:
+        raise RuntimeError(f"Gemini вернул ошибку: {data.get('error', data)}")
+    parts = data["candidates"][0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts).strip()
+
+
+async def call_ai(session, system, user_msg, max_tokens):
+    """Единая точка вызова ИИ — выбирает провайдера по AI_PROVIDER."""
+    if AI_PROVIDER == "anthropic":
+        return await _call_anthropic(session, system, user_msg, max_tokens)
+    if AI_PROVIDER == "gemini":
+        return await _call_gemini(session, system, user_msg, max_tokens)
+    return await _call_openai(session, system, user_msg, max_tokens)
 
 
 # ============================================================
