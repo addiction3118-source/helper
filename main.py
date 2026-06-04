@@ -28,13 +28,18 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
-AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").strip().lower()   # gemini / openai / anthropic
+AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").strip().lower()   # gemini / openai / anthropic / groq
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# Несколько ключей Gemini через запятую: GEMINI_API_KEY=key1,key2,key3
+_gemini_keys = [k.strip() for k in os.getenv("GEMINI_API_KEY", "").split(",") if k.strip()]
+GEMINI_API_KEY = _gemini_keys[0] if _gemini_keys else ""
 
 USE_AI_FILTER = os.getenv("USE_AI_FILTER", "true").strip().lower() == "true"
 
@@ -472,21 +477,55 @@ RANK = {"easy": 1, "medium": 2, "hard": 3}
 
 _ai_lock = asyncio.Lock()   # чтобы запросы к ИИ шли по одному
 
+# Ротация Gemini-ключей при исчерпании лимита
+_gemini_key_index = 0
+
+def _current_gemini_key() -> str:
+    return _gemini_keys[_gemini_key_index] if _gemini_keys else ""
+
+def _rotate_gemini_key() -> bool:
+    """Переключается на следующий ключ. Возвращает False если ключи кончились."""
+    global _gemini_key_index
+    if _gemini_key_index + 1 < len(_gemini_keys):
+        _gemini_key_index += 1
+        log.warning("Gemini: переключаюсь на ключ #%d", _gemini_key_index + 1)
+        return True
+    return False
+
 async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int]:
     msg = (f"Заголовок: {job.title}\nОписание: {job.description[:800]}\n"
            f"Бюджет: {job.budget or 'не указан'}")
     try:
         async with _ai_lock:
-            await asyncio.sleep(AI_DELAY)          # пауза, чтобы не превысить лимит
+            await asyncio.sleep(AI_DELAY)
             raw = await call_ai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
     except Exception as e:
         msg_e = str(e)
         if "RESOURCE_EXHAUSTED" in msg_e or "429" in msg_e:
-            log.warning("Лимит Gemini, жду 60с…")
-            await asyncio.sleep(60)                # упёрлись в лимит — ждём минуту
+            if AI_PROVIDER == "gemini" and _rotate_gemini_key():
+                log.warning("Лимит ключа Gemini — переключился, повторяю запрос…")
+                try:
+                    async with _ai_lock:
+                        raw = await call_ai(session, ANALYZE_SYSTEM, msg, max_tokens=40)
+                except Exception as e2:
+                    log.warning("Новый ключ тоже не помог: %s", e2)
+                    return "no", 0
+            else:
+                if GROQ_API_KEY:
+                    log.warning("Все ключи Gemini исчерпаны — переключаюсь на Groq…")
+                    try:
+                        async with _ai_lock:
+                            raw = await _call_groq(session, ANALYZE_SYSTEM, msg, max_tokens=40)
+                    except Exception as e3:
+                        log.warning("Groq тоже не помог: %s", e3)
+                        return "no", 0
+                else:
+                    log.warning("Все ключи Gemini исчерпаны, жду 60с…")
+                    await asyncio.sleep(60)
+                    return "no", 0
         else:
-            log.warning("ИИ-анализ недоступен, заказ пропускаю (не оценён): %s", e)
-        return "no", 0
+            log.warning("ИИ-анализ недоступен, заказ пропускаю: %s", e)
+            return "no", 0
     
     txt = raw.strip().strip("`")
     txt = re.sub(r"^json", "", txt, flags=re.IGNORECASE).strip()
@@ -585,10 +624,9 @@ async def _call_openai(session, system, user_msg, max_tokens):
 
 
 async def _call_gemini(session, system, user_msg, max_tokens):
-    # ключ передаём в заголовке (работает и для старых AIza, и для новых AQ. ключей)
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{GEMINI_MODEL}:generateContent")
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    headers = {"x-goog-api-key": _current_gemini_key(), "Content-Type": "application/json"}
     payload = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": [{"parts": [{"text": user_msg}]}],
@@ -606,12 +644,28 @@ async def _call_gemini(session, system, user_msg, max_tokens):
     return "".join(p.get("text", "") for p in parts).strip()
 
 
+async def _call_groq(session, system, user_msg, max_tokens):
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": GROQ_MODEL, "max_tokens": max_tokens,
+               "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user_msg}]}
+    async with session.post("https://api.groq.com/openai/v1/chat/completions",
+                            headers=headers, json=payload,
+                            timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        data = await resp.json()
+    if "choices" not in data:
+        raise RuntimeError(f"Groq вернул ошибку: {data.get('error', data)}")
+    return data["choices"][0]["message"]["content"].strip()
+
+
 async def call_ai(session, system, user_msg, max_tokens):
     """Единая точка вызова ИИ — выбирает провайдера по AI_PROVIDER."""
     if AI_PROVIDER == "anthropic":
         return await _call_anthropic(session, system, user_msg, max_tokens)
     if AI_PROVIDER == "gemini":
         return await _call_gemini(session, system, user_msg, max_tokens)
+    if AI_PROVIDER == "groq":
+        return await _call_groq(session, system, user_msg, max_tokens)
     return await _call_openai(session, system, user_msg, max_tokens)
 
 
