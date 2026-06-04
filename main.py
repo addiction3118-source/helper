@@ -653,7 +653,6 @@ async def _call_groq(session, system, user_msg, max_tokens):
                             headers=headers, json=payload,
                             timeout=aiohttp.ClientTimeout(total=60)) as resp:
         data = await resp.json()
-    log.info("Groq ответ: %s", str(data)[:300])
     if "choices" not in data:
         raise RuntimeError(f"Groq вернул ошибку: {data.get('error', data)}")
     return data["choices"][0]["message"]["content"].strip()
