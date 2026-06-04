@@ -1,19 +1,3 @@
-"""
-Telegram-бот для мониторинга фриланс-бирж под ЧИСТЫЙ вайбкодинг.
-Парсит RSS бирж, через ИИ фильтрует/оценивает заказы, шлёт карточки с
-кнопками: промпт-отклик (3 варианта), оценка цены/времени, избранное, 👍/👎.
-
-Фичи: скоринг 1-10, фильтр по сложности и бюджету, обучение на 👍/👎,
-команды управления из чата, сводка за день, тихие часы, дедуп дублей,
-русские и английские биржи, мониторинг ключевых тегов.
-
-Секреты — в .env. Установка: pip install -r requirements.txt
-Запуск: python main.py  (или кнопка ▷ в VS Code)
-
-ВАЖНО про Render free: диск временный, при передеплое seen.db обнуляется
-(избранное/обучение/настройки сбросятся). Для постоянного хранения — Postgres.
-"""
-
 import os
 import re
 import json
@@ -164,6 +148,7 @@ def db_init():
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS seen (uid TEXT PRIMARY KEY, title_key TEXT, ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS prefs (word TEXT PRIMARY KEY, w INTEGER)")
     c.execute("CREATE TABLE IF NOT EXISTS favorites (uid TEXT PRIMARY KEY, data TEXT, ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS jobs_log (uid TEXT PRIMARY KEY, title TEXT, link TEXT, score INTEGER, source TEXT, ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS pending (uid TEXT PRIMARY KEY, data TEXT)")
@@ -467,8 +452,10 @@ async def _call_openai(session, system, user_msg, max_tokens):
 
 
 async def _call_gemini(session, system, user_msg, max_tokens):
+    # ключ передаём в заголовке (работает и для старых AIza, и для новых AQ. ключей)
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+           f"{GEMINI_MODEL}:generateContent")
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     payload = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": [{"parts": [{"text": user_msg}]}],
@@ -477,7 +464,7 @@ async def _call_gemini(session, system, user_msg, max_tokens):
         "generationConfig": {"maxOutputTokens": max_tokens,
                              "thinkingConfig": {"thinkingBudget": 0}},
     }
-    async with session.post(url, json=payload,
+    async with session.post(url, headers=headers, json=payload,
                             timeout=aiohttp.ClientTimeout(total=60)) as resp:
         data = await resp.json()
     if "candidates" not in data:
