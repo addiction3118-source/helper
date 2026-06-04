@@ -153,6 +153,13 @@ def db_init():
     c.execute("CREATE TABLE IF NOT EXISTS favorites (uid TEXT PRIMARY KEY, data TEXT, ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS jobs_log (uid TEXT PRIMARY KEY, title TEXT, link TEXT, score INTEGER, source TEXT, ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS pending (uid TEXT PRIMARY KEY, data TEXT)")
+    c.execute("""CREATE TABLE IF NOT EXISTS scan_stats (
+        id INTEGER PRIMARY KEY,
+        ts TEXT,
+        scanned INTEGER,
+        passed_filter INTEGER,
+        sent INTEGER
+    )""")
     conn.commit()
     conn.close()
 
@@ -262,6 +269,49 @@ def pop_pending() -> list[Job]:
     conn.commit()
     conn.close()
     return [Job.from_dict(json.loads(r[0])) for r in rows]
+
+
+def log_scan(scanned: int, passed: int, sent: int):
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO scan_stats (ts, scanned, passed_filter, sent) VALUES (?,?,?,?)",
+        (datetime.now(timezone.utc).isoformat(), scanned, passed, sent),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_stats() -> dict:
+    conn = _conn()
+    total_seen = conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+    total_sent = conn.execute("SELECT COUNT(*) FROM jobs_log").fetchone()[0]
+    total_favs = conn.execute("SELECT COUNT(*) FROM favorites").fetchone()[0]
+    since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    sent_24h = conn.execute(
+        "SELECT COUNT(*) FROM jobs_log WHERE ts > ?", (since_24h,)
+    ).fetchone()[0]
+    # топ бирж по количеству отправленных
+    top_sources = conn.execute(
+        "SELECT source, COUNT(*) as cnt FROM jobs_log GROUP BY source ORDER BY cnt DESC LIMIT 5"
+    ).fetchall()
+    # среднее время между запросами (последние 10 сканов)
+    scans = conn.execute(
+        "SELECT scanned, passed_filter, sent FROM scan_stats ORDER BY id DESC LIMIT 10"
+    ).fetchall()
+    conn.close()
+
+    total_scanned = sum(r[0] for r in scans)
+    total_passed = sum(r[1] for r in scans)
+    return {
+        "total_seen": total_seen,
+        "total_sent": total_sent,
+        "total_favs": total_favs,
+        "sent_24h": sent_24h,
+        "top_sources": top_sources,
+        "scans_count": len(scans),
+        "scanned_last10": total_scanned,
+        "passed_last10": total_passed,
+    }
 
 
 # ============================================================
@@ -634,6 +684,7 @@ async def cmd_start(msg: Message):
         "/difficulty easy|medium|hard — макс. сложность\n"
         "/favorites — избранное\n"
         "/digest — сводка за 24 часа\n"
+        "/stats — статистика бота\n"
         "/pause /resume — пауза/возобновить"
     )
 
@@ -703,6 +754,29 @@ async def cmd_digest(msg: Message):
     await send_digest(force=True)
 
 
+@dp.message(Command("stats"))
+async def cmd_stats(msg: Message):
+    s = get_stats()
+    sources_text = "\n".join(
+        f"  {src}: {cnt}" for src, cnt in s["top_sources"]
+    ) or "  нет данных"
+    filter_rate = (
+        f"{s['passed_last10'] / s['scanned_last10'] * 100:.0f}%"
+        if s["scanned_last10"] else "—"
+    )
+    await msg.answer(
+        "📊 <b>Статистика бота</b>\n\n"
+        f"👁 Просмотрено всего: {s['total_seen']}\n"
+        f"✅ Отправлено всего: {s['total_sent']}\n"
+        f"📅 Отправлено за 24ч: {s['sent_24h']}\n"
+        f"⭐ В избранном: {s['total_favs']}\n\n"
+        f"🔍 Прошло фильтр (последние {s['scans_count']} сканов): "
+        f"{s['passed_last10']} из {s['scanned_last10']} ({filter_rate})\n\n"
+        f"🏆 Топ бирж по отправленным:\n{sources_text}",
+        parse_mode="HTML",
+    )
+
+
 async def send_digest(force: bool = False):
     rows = jobs_last_24h()
     if not rows:
@@ -723,7 +797,9 @@ async def send_digest(force: bool = False):
 async def run_scan() -> int:
     if is_paused():
         return 0
-    found = 0
+    scanned = 0
+    passed = 0
+    sent = 0
     async with aiohttp.ClientSession() as session:
         for src in SOURCES:
             if not src.get("enabled"):
@@ -733,15 +809,18 @@ async def run_scan() -> int:
                 if is_seen(job.uid, tk):
                     continue
                 mark_seen(job.uid, tk)
+                scanned += 1
                 if not await evaluate(session, job):
                     continue
+                passed += 1
                 log_job(job)
                 if in_quiet_hours():
-                    queue_pending(job)       # ночью копим
+                    queue_pending(job)
                 else:
                     await send_card(job)
-                found += 1
-    return found
+                    sent += 1
+    log_scan(scanned, passed, sent)
+    return passed
 
 
 async def poller():
