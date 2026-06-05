@@ -71,15 +71,19 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
 AI_DELAY = int(os.getenv("AI_DELAY", "13"))   # пауза между запросами к ИИ
 
-# --- Kwork через почту (Gmail IMAP) ---
-# Заведи в Kwork подписку на нужные категории — он будет слать письма о новых
-# проектах. Бот читает их из почты. Нужен app password Gmail (не основной пароль).
-KWORK_EMAIL_ENABLED = os.getenv("KWORK_EMAIL_ENABLED", "false").strip().lower() == "true"
+# --- Биржи через почту (Gmail IMAP) ---
+# Подпишись на email-уведомления о новых заказах на нужных биржах (Kwork, FL.ru,
+# Freelance.ru, YouDo и т.д.), указав этот Gmail. Бот читает письма и достаёт
+# заказы — так обходятся площадки с капчей/антибот-защитой без нарушений.
+# Нужен app password Gmail (не основной пароль).
+# EMAIL_ENABLED — новое имя; KWORK_EMAIL_ENABLED оставлен для совместимости.
+KWORK_EMAIL_ENABLED = (
+    os.getenv("EMAIL_ENABLED", os.getenv("KWORK_EMAIL_ENABLED", "false"))
+    .strip().lower() == "true"
+)
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com").strip()
 IMAP_USER = os.getenv("IMAP_USER", "").strip()
 IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "").strip()   # app password
-# От какого адреса приходят письма Kwork (по нему фильтруем входящие)
-KWORK_FROM = os.getenv("KWORK_FROM", "kwork.ru").strip().lower()
 
 # ============================================================
 #                   ИСТОЧНИКИ (биржи)
@@ -590,35 +594,59 @@ def _email_body(msg: email.message.Message) -> str:
     return html_body or text_body
 
 
-# ссылки на проекты Kwork в письме
-_KWORK_LINK_RE = re.compile(r"https?://kwork\.ru/projects/\d+[^\s\"'<>]*", re.IGNORECASE)
+# Площадки, заказы которых ловим через почтовые уведомления.
+# Для каждой: name — как подписать источник, domain — часть адреса отправителя,
+# link_re — как выглядят ссылки на заказ в письме.
+# Добавляешь новую биржу → дописываешь сюда строку и подписываешься на её рассылку.
+EMAIL_SOURCES = [
+    {"name": "Kwork", "domain": "kwork.ru",
+     "link_re": re.compile(r"https?://kwork\.ru/projects/\d+[^\s\"'<>]*", re.I)},
+    {"name": "FL.ru", "domain": "fl.ru",
+     "link_re": re.compile(r"https?://(?:www\.)?fl\.ru/projects/\d+[^\s\"'<>]*", re.I)},
+    {"name": "Freelance.ru", "domain": "freelance.ru",
+     "link_re": re.compile(r"https?://(?:www\.)?freelance\.ru/project/\d+[^\s\"'<>]*", re.I)},
+    {"name": "Weblancer", "domain": "weblancer.net",
+     "link_re": re.compile(r"https?://(?:www\.)?weblancer\.net/projects/[^\s\"'<>]+", re.I)},
+    {"name": "Habr Freelance", "domain": "freelance.habr.com",
+     "link_re": re.compile(r"https?://freelance\.habr\.com/tasks/\d+[^\s\"'<>]*", re.I)},
+    {"name": "YouDo", "domain": "youdo.com",
+     "link_re": re.compile(r"https?://youdo\.com/t\d+[^\s\"'<>]*", re.I)},
+]
 
 
-def _parse_kwork_email(subject: str, body: str) -> list[Job]:
+def _match_email_source(sender: str) -> dict | None:
+    """По адресу отправителя находим биржу из EMAIL_SOURCES."""
+    s = sender.lower()
+    for src in EMAIL_SOURCES:
+        if src["domain"] in s:
+            return src
+    return None
+
+
+def _parse_email(src: dict, subject: str, body: str) -> list[Job]:
     """Из одного письма достаём заказы: ссылки на проекты + заголовок."""
     jobs: list[Job] = []
-    links = list(dict.fromkeys(_KWORK_LINK_RE.findall(body)))  # уникальные, порядок
+    links = list(dict.fromkeys(src["link_re"].findall(body)))  # уникальные, порядок
     text = _strip_tags(body)
     text = re.sub(r"\s+", " ", text).strip()
-    # тема письма обычно содержит название проекта
-    title = _decode_mime(subject) or "Заказ с Kwork"
+    title = _decode_mime(subject) or f"Заказ с {src['name']}"
     budget = extract_budget(f"{title} {text}")
+    lang = detect_lang(f"{title} {text}")
     for link in links:
-        jobs.append(Job(source="Kwork", title=title, link=link,
-                        description=text[:800], budget=budget,
+        jobs.append(Job(source=src["name"], title=title, link=link,
+                        description=text[:800], budget=budget, lang=lang,
                         published_at=datetime.now(timezone.utc).isoformat()))
     return jobs
 
 
-def _fetch_kwork_blocking() -> list[Job]:
-    """Синхронное чтение непрочитанных писем Kwork по IMAP. Помечает прочитанными."""
+def _fetch_email_blocking() -> list[Job]:
+    """Синхронное чтение непрочитанных писем по IMAP со всех бирж из EMAIL_SOURCES."""
     jobs: list[Job] = []
     try:
         imap = imaplib.IMAP4_SSL(IMAP_HOST)
         imap.login(IMAP_USER, IMAP_PASSWORD)
         imap.select("INBOX")
-        # только непрочитанные письма от Kwork
-        status, data = imap.search(None, 'UNSEEN', 'FROM', KWORK_FROM)
+        status, data = imap.search(None, "UNSEEN")
         if status != "OK":
             imap.logout()
             return jobs
@@ -628,21 +656,24 @@ def _fetch_kwork_blocking() -> list[Job]:
             if status != "OK" or not msg_data or not msg_data[0]:
                 continue
             msg = email.message_from_bytes(msg_data[0][1])
+            sender = str(msg.get("From", ""))
+            src = _match_email_source(sender)
+            if not src:                       # письмо не от биржи — пропускаем
+                continue
             subject = msg.get("Subject", "")
             body = _email_body(msg)
-            jobs.extend(_parse_kwork_email(subject, body))
-            # письмо остаётся прочитанным (UNSEEN снимается автоматически при fetch)
+            jobs.extend(_parse_email(src, subject, body))
         imap.logout()
     except Exception as e:
-        log.warning("Kwork (почта) недоступна: %s", e)
+        log.warning("Почта недоступна: %s", e)
     return jobs
 
 
-async def fetch_kwork_email() -> list[Job]:
+async def fetch_email_jobs() -> list[Job]:
     """Асинхронная обёртка — IMAP блокирующий, выносим в поток."""
     if not (KWORK_EMAIL_ENABLED and IMAP_USER and IMAP_PASSWORD):
         return []
-    return await asyncio.to_thread(_fetch_kwork_blocking)
+    return await asyncio.to_thread(_fetch_email_blocking)
 
 
 # ============================================================
@@ -1252,7 +1283,7 @@ async def run_scan() -> int:
             if not src.get("enabled"):
                 continue
             candidates.extend(await fetch_source(session, src))
-        candidates.extend(await fetch_kwork_email())
+        candidates.extend(await fetch_email_jobs())
 
         for job in candidates:
             tk = title_key(job.title)
