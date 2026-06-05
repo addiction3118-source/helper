@@ -10,6 +10,7 @@ import email
 from email.header import decode_header
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from collections import OrderedDict
 
 import aiohttp
 from aiohttp import web
@@ -223,6 +224,9 @@ class Job:
 def db_init():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # WAL ускоряет запись и снимает блокировки чтения/записи
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
     c.execute("CREATE TABLE IF NOT EXISTS seen (uid TEXT PRIMARY KEY, title_key TEXT, ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS prefs (word TEXT PRIMARY KEY, w INTEGER)")
@@ -237,12 +241,18 @@ def db_init():
         sent INTEGER
     )""")
     c.execute("CREATE TABLE IF NOT EXISTS authors_seen (author TEXT, ts TEXT)")
+    # индексы — быстрый поиск по часто запрашиваемым колонкам
+    c.execute("CREATE INDEX IF NOT EXISTS idx_seen_titlekey ON seen(title_key)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_ts ON jobs_log(ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_authors ON authors_seen(author, ts)")
     conn.commit()
     conn.close()
 
 
 def _conn():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA busy_timeout=5000")   # ждём до 5с при блокировке вместо ошибки
+    return conn
 
 
 def title_key(title: str) -> str:
@@ -954,12 +964,17 @@ _session.timeout = 60
 bot = Bot(token=BOT_TOKEN, session=_session)
 dp = Dispatcher()
 
-job_cache: dict[str, Job] = {}
+job_cache: "OrderedDict[str, Job]" = OrderedDict()
+JOB_CACHE_LIMIT = 500   # держим последние N заказов для кнопок, старые вытесняем
 
 
 def _key(job: Job) -> str:
     k = str(abs(hash(job.uid)) % (10**12))
     job_cache[k] = job
+    job_cache.move_to_end(k)
+    # вытесняем самые старые, чтобы память не росла бесконечно (бесплатный Render 512MB)
+    while len(job_cache) > JOB_CACHE_LIMIT:
+        job_cache.popitem(last=False)
     return k
 
 
@@ -1277,13 +1292,18 @@ async def run_scan() -> int:
     new_jobs: list[Job] = []
 
     async with aiohttp.ClientSession() as session:
-        # собираем кандидатов: RSS-биржи + Kwork из почты
+        # собираем кандидатов: RSS-биржи (параллельно) + биржи из почты
         candidates: list[Job] = []
-        for src in SOURCES:
-            if not src.get("enabled"):
+        enabled = [s for s in SOURCES if s.get("enabled")]
+        tasks = [fetch_source(session, src) for src in enabled]
+        tasks.append(fetch_email_jobs())
+        # параллельная загрузка: 7 бирж грузятся разом, а не по очереди
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                log.warning("Источник упал при загрузке: %s", res)
                 continue
-            candidates.extend(await fetch_source(session, src))
-        candidates.extend(await fetch_email_jobs())
+            candidates.extend(res)
 
         for job in candidates:
             tk = title_key(job.title)
@@ -1411,14 +1431,13 @@ async def main():
 
     # На бесплатном Render деплой не zero-downtime: старый экземпляр ещё
     # держит getUpdates, пока стартует новый. Сбрасываем вебхук и копим
-    # обновления заново, а небольшая пауза даёт старому процессу умереть —
-    # так конфликтов при старте меньше.
+    # обновления заново. Раньше тут была фиксированная пауза 15с — теперь
+    # стартуем сразу, а паузу/ретраи берёт на себя цикл polling ниже
+    # (он сам переживает TelegramConflictError). Так бот стартует быстрее.
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         log.warning("Не удалось сбросить вебхук: %s", e)
-    log.info("Жду 15с, чтобы старый экземпляр освободил соединение…")
-    await asyncio.sleep(15)
 
     asyncio.create_task(poller())
     asyncio.create_task(quiet_flush_loop())
