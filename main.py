@@ -111,7 +111,8 @@ BACKUP_CHAT_ID = env_int("BACKUP_CHAT_ID", 0) or CHAT_ID
 
 SOURCES = [
     # --- русские биржи с откликами ---
-    {"name": "Habr Freelance", "enabled": True,
+    # Habr Freelance отключён — RSS убрали (отдаёт 410 Gone). Площадка закрыла фид.
+    {"name": "Habr Freelance", "enabled": False,
      "url": "https://freelance.habr.com/tasks.rss"},
     # Weblancer отключён — отклики платные (нужен PRO)
     {"name": "Weblancer", "enabled": False,
@@ -120,8 +121,8 @@ SOURCES = [
     # чтобы видеть заказы (откликаться можно с PRO или иначе)
     {"name": "FL.ru", "enabled": True,
      "url": "https://www.fl.ru/rss/all.xml"},
-    # Freelance.ru оставлен — фильтр заказов можно настроить через почтовые подписки
-    {"name": "Freelance.ru", "enabled": True,
+    # Freelance.ru отключён — RSS убрали (отдаёт 404). Фид больше не работает.
+    {"name": "Freelance.ru", "enabled": False,
      "url": "https://freelance.ru/rss/projects"},
     {"name": "Workspace", "enabled": True,
      "url": "https://workspace.ru/tenders/rss/"},
