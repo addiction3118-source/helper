@@ -113,10 +113,12 @@ SOURCES = [
     # --- русские биржи с откликами ---
     {"name": "Habr Freelance", "enabled": True,
      "url": "https://freelance.habr.com/tasks.rss"},
-    # Weblancer / FL.ru отключены — отклики платные (нужен PRO)
+    # Weblancer отключён — отклики платные (нужен PRO)
     {"name": "Weblancer", "enabled": False,
      "url": "https://www.weblancer.net/rss/projects/"},
-    {"name": "FL.ru", "enabled": False,
+    # FL.ru — отклик платный (PRO), но много заказов под вайбкодинг; включён,
+    # чтобы видеть заказы (откликаться можно с PRO или иначе)
+    {"name": "FL.ru", "enabled": True,
      "url": "https://www.fl.ru/rss/all.xml"},
     # Freelance.ru оставлен — фильтр заказов можно настроить через почтовые подписки
     {"name": "Freelance.ru", "enabled": True,
