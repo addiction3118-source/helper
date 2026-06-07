@@ -47,6 +47,7 @@ TG_AUTOJOIN = os.getenv("TG_AUTOJOIN", "false").strip().lower() == "true"
 TG_JOIN_DELAY = _int("TG_JOIN_DELAY", 45)          # пауза между вступлениями, сек
 
 _client = None   # один клиент на весь процесс
+_last_scan: dict = {}   # инфо о последнем скане каналов (для команды /tg)
 
 
 def tg_available() -> bool:
@@ -194,17 +195,20 @@ async def _scan_once(client, process_candidates, dispatch_jobs, log_scan,
     candidates = []
     for ch in TG_CHANNELS:          # последовательно — чтобы не словить флуд-лимит
         candidates.extend(await _fetch_channel(client, ch, max_age_hours))
-    if not candidates:
-        return
 
-    # общий лок с RSS-сканом: не обрабатываем одни и те же источники параллельно
-    async with scan_lock:
-        async with aiohttp.ClientSession() as session:
-            scanned, passed, new_jobs = await process_candidates(session, candidates)
-        sent = await dispatch_jobs(new_jobs)
-    log_scan(scanned, passed, sent)
-    if passed:
-        log.info("TG-парсер: новых заказов из каналов: %d", passed)
+    scanned = passed = sent = 0
+    if candidates:
+        # общий лок с RSS-сканом: не обрабатываем одни и те же источники параллельно
+        async with scan_lock:
+            async with aiohttp.ClientSession() as session:
+                scanned, passed, new_jobs = await process_candidates(session, candidates)
+            sent = await dispatch_jobs(new_jobs)
+        log_scan(scanned, passed, sent)
+        if passed:
+            log.info("TG-парсер: новых заказов из каналов: %d", passed)
+
+    _last_scan.update(ts=datetime.now(timezone.utc).isoformat(),
+                      candidates=len(candidates), passed=passed, sent=sent)
 
 
 async def tg_poll_loop():
@@ -236,3 +240,46 @@ async def tg_poll_loop():
         except Exception as e:
             log.error("TG-парсер: ошибка скана: %s", e)
         await asyncio.sleep(TG_POLL_INTERVAL)
+
+
+async def tg_status() -> str:
+    """Текст для команды /tg — текущее состояние парсера каналов (HTML)."""
+    import html as _html
+
+    if not TG_ENABLED:
+        return "🔌 <b>TG-парсер каналов</b>\nВыключен (TG_ENABLED не задан)."
+    if not tg_available():
+        return ("📡 <b>TG-парсер каналов</b>\n⚠️ Включён, но не хватает настроек "
+                "(TG_API_ID / TG_API_HASH / TG_SESSION / TG_CHANNELS).")
+
+    lines = ["📡 <b>TG-парсер каналов</b>"]
+    try:
+        client = await _get_client()
+        me = await client.get_me()
+        who = "@" + (me.username or str(me.id))
+    except Exception as e:
+        lines.append(f"❌ Клиент не подключён: {_html.escape(str(e))}")
+        return "\n".join(lines)
+
+    lines.append(f"Аккаунт: <b>{_html.escape(who)}</b>")
+    lines.append(f"Авто-join: <b>{'вкл' if TG_AUTOJOIN else 'выкл'}</b>")
+    lines.append(f"Интервал: каждые {max(1, TG_POLL_INTERVAL // 60)} мин")
+    lines.append(f"\nКаналов: <b>{len(TG_CHANNELS)}</b>")
+    lines.append("\n".join(f"  • {_html.escape(c)}" for c in TG_CHANNELS))
+
+    if _last_scan:
+        try:
+            ago = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(_last_scan["ts"])).total_seconds() / 60
+            ago_txt = f"{int(ago)} мин назад"
+        except Exception:
+            ago_txt = "недавно"
+        lines.append(
+            f"\nПоследний скан: {ago_txt}\n"
+            f"  постов: {_last_scan.get('candidates', 0)} · "
+            f"прошло фильтр: {_last_scan.get('passed', 0)} · "
+            f"отправлено: {_last_scan.get('sent', 0)}"
+        )
+    else:
+        lines.append("\nЕщё не сканировал — подожди первый цикл.")
+    return "\n".join(lines)

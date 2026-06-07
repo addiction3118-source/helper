@@ -1008,6 +1008,7 @@ def commands_text() -> str:
         "/digest — сводка за 24 часа\n"
         "/stats — статистика\n"
         "/activity — график активности по часам\n"
+        "/tg — статус парсера Telegram-каналов\n"
         "/quiet — тихие часы\n"
         "/backup /restore — бэкап и восстановление базы\n"
         "/pause /resume — пауза/возобновить"
@@ -1250,6 +1251,12 @@ async def show_activity(target):
 @dp.message(Command("activity"))
 async def cmd_activity(msg: Message):
     await show_activity(msg)
+
+
+@dp.message(Command("tg"))
+async def cmd_tg(msg: Message):
+    await msg.answer(await tg_parser.tg_status(), parse_mode="HTML",
+                     reply_markup=home_kb(), disable_web_page_preview=True)
 
 
 # Подсказки для ForceReply — текст сравнивается точь-в-точь в on_force_reply,
