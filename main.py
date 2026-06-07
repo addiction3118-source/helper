@@ -85,6 +85,9 @@ MAX_PER_AUTHOR = env_int("MAX_PER_AUTHOR", 3)         # макс. заказов
 SCAM_THRESHOLD = env_int("SCAM_THRESHOLD", 7)        # с какого риска резать скам
 
 POLL_INTERVAL = env_int("POLL_INTERVAL", 300)
+# Раз в столько дней бот сам ищет новые TG-каналы и присылает их на одобрение.
+# 0 = выключить авто-поиск (команда /discover всё равно работает вручную).
+TG_DISCOVER_DAYS = env_int("TG_DISCOVER_DAYS", 7)
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").split("#", 1)[0].strip()
 # Прокси для запросов к ИИ. По умолчанию = TELEGRAM_PROXY (Groq/Gemini в РФ
 # блокируются по гео и отдают 403 — локально нужен иностранный прокси).
@@ -263,6 +266,8 @@ def db_init():
         sent INTEGER
     )""")
     c.execute("CREATE TABLE IF NOT EXISTS authors_seen (author TEXT, ts TEXT)")
+    # каналы, добавленные на лету через /discover (хранятся в БД, не в .env)
+    c.execute("CREATE TABLE IF NOT EXISTS tg_channels (uname TEXT PRIMARY KEY, ts TEXT)")
     # миграция старых баз: добавляем колонки, появившиеся в новых версиях,
     # чтобы индексы ниже и восстановленные старые бэкапы не падали
     _ensure_column(c, "seen", "title_key", "TEXT")
@@ -411,6 +416,28 @@ def mark_author(author: str):
                  (author, datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
+
+
+def tg_add_channel(uname: str):
+    conn = _conn()
+    conn.execute("INSERT OR IGNORE INTO tg_channels (uname, ts) VALUES (?,?)",
+                 (uname.lower().lstrip("@"), datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def tg_del_channel(uname: str):
+    conn = _conn()
+    conn.execute("DELETE FROM tg_channels WHERE uname=?", (uname.lower().lstrip("@"),))
+    conn.commit()
+    conn.close()
+
+
+def tg_get_channels() -> list[str]:
+    conn = _conn()
+    rows = conn.execute("SELECT uname FROM tg_channels ORDER BY ts").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 
 def activity_by_hour() -> list[int]:
@@ -1002,12 +1029,15 @@ def commands_text() -> str:
         "Мониторю фриланс-биржи и шлю заказы под вайбкодинг.\n"
         "Управляй кнопками ниже или командами:\n\n"
         "/check — проверить сейчас\n"
+        "/status — что бот делает прямо сейчас\n"
         "/settings — настройки (бюджет, сложность, тихие часы, пауза)\n"
         "/favorites — избранное\n"
         "/digest — сводка за 24 часа\n"
         "/stats — статистика\n"
         "/activity — график активности по часам\n"
         "/tg — статус парсера Telegram-каналов\n"
+        "/discover — найти новые каналы\n"
+        "/tgchannels — список каналов (добавить/удалить)\n"
         "/quiet — тихие часы\n"
         "/backup /restore — бэкап и восстановление базы\n"
         "/pause /resume — пауза/возобновить"
@@ -1018,11 +1048,12 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     """Главное меню кнопками — то же, что команды, но без набора."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔎 Проверить сейчас", callback_data="menu:check")],
-        [InlineKeyboardButton(text="Избранное", callback_data="menu:fav"),
-         InlineKeyboardButton(text="Сводка 24ч", callback_data="menu:digest")],
-        [InlineKeyboardButton(text="Статистика", callback_data="menu:stats"),
-         InlineKeyboardButton(text="Активность", callback_data="menu:activity")],
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="🟢 Статус", callback_data="menu:status"),
+         InlineKeyboardButton(text="Избранное", callback_data="menu:fav")],
+        [InlineKeyboardButton(text="Сводка 24ч", callback_data="menu:digest"),
+         InlineKeyboardButton(text="Статистика", callback_data="menu:stats")],
+        [InlineKeyboardButton(text="Активность", callback_data="menu:activity"),
+         InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
     ])
 
 
@@ -1054,6 +1085,9 @@ async def cb_menu(cb: CallbackQuery):
         await cb.answer("Проверяю биржи…")
         n = await run_scan()
         await cb.message.answer(f"Готово. Новых подходящих: {n}", reply_markup=home_kb())
+    elif action == "status":
+        await cb.answer()
+        await cb.message.answer(bot_status_text(), parse_mode="HTML", reply_markup=home_kb())
     elif action == "fav":
         await cb.answer()
         await show_favorites(cb.message)
@@ -1256,6 +1290,143 @@ async def cmd_activity(msg: Message):
 async def cmd_tg(msg: Message):
     await msg.answer(await tg_parser.tg_status(), parse_mode="HTML",
                      reply_markup=home_kb(), disable_web_page_preview=True)
+
+
+def _ago_min(ts: str) -> str:
+    """«N мин назад» из ISO-времени UTC. Пусто/битое → '—'."""
+    try:
+        m = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds() / 60
+        return f"{int(m)} мин назад"
+    except Exception:
+        return "—"
+
+
+def bot_status_text() -> str:
+    """Живой статус: анализирует ли бот сейчас, когда был последний анализ и т.д."""
+    st = _scan_status
+    if is_paused():
+        head = "⏸ <b>Бот на паузе</b>\n(/resume или кнопка в настройках — продолжить)"
+    elif st["running"]:
+        head = "🟢 <b>Бот сейчас анализирует вакансии…</b>"
+    else:
+        head = "🟢 <b>Бот работает</b> — ждёт следующего скана"
+
+    lines = [head, ""]
+    if st["last_ts"]:
+        lines.append(
+            f"Последний анализ: {_ago_min(st['last_ts'])}\n"
+            f"  оценено ИИ: {st['last_scanned']} · прошло фильтр: {st['last_passed']}"
+        )
+    else:
+        lines.append("Анализа ещё не было — подожди первый цикл.")
+    lines.append(f"\nRSS-сканы: каждые {max(1, POLL_INTERVAL // 60)} мин")
+    lines.append(f"ИИ-провайдер: <b>{AI_PROVIDER}</b>")
+
+    if tg_parser.tg_available():
+        ls = tg_parser._last_scan
+        tg_line = f"\nTG-каналы: {len(tg_parser.TG_CHANNELS)} шт."
+        if ls:
+            tg_line += (f"\n  последний скан каналов: {_ago_min(ls.get('ts', ''))} "
+                        f"(постов {ls.get('candidates', 0)}, прошло {ls.get('passed', 0)})")
+        lines.append(tg_line)
+
+    return "\n".join(lines)
+
+
+@dp.message(Command("status"))
+async def cmd_status(msg: Message):
+    await msg.answer(bot_status_text(), parse_mode="HTML", reply_markup=home_kb())
+
+
+# -------------------- поиск и список TG-каналов --------------------
+
+def _discover_kb(found: list) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=f"➕ @{u}", callback_data=f"tgadd:{u}")]
+            for u, _ in found]
+    rows.append([home_button()])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def run_discover(target):
+    """Ищет каналы-кандидаты и присылает их с кнопками «Добавить»."""
+    if not tg_parser.tg_available():
+        await target.answer("TG-парсер выключен (TG_ENABLED). Включи его, потом ищи каналы.",
+                            reply_markup=home_kb())
+        return
+    await target.answer("🔎 Ищу новые каналы — это займёт до минуты…")
+    async with aiohttp.ClientSession() as s:
+        found = await tg_parser.discover(s, AI_PROXY)
+    if not found:
+        await target.answer(
+            "Новых подходящих каналов не нашёл. Добавь пару рабочих каналов "
+            "(в TG_CHANNELS или из найденных) — от них поиск находит похожие.",
+            reply_markup=home_kb())
+        return
+    text = ("🔎 <b>Каналы-кандидаты</b>\nНажми «➕», чтобы подключить:\n\n"
+            + "\n".join(f"• @{u} — релевантность {sc}\n  https://t.me/{u}"
+                        for u, sc in found))
+    await target.answer(text, parse_mode="HTML", disable_web_page_preview=True,
+                        reply_markup=_discover_kb(found))
+
+
+@dp.message(Command("discover"))
+async def cmd_discover(msg: Message):
+    await run_discover(msg)
+
+
+@dp.callback_query(F.data.startswith("tgadd:"))
+async def cb_tgadd(cb: CallbackQuery):
+    u = cb.data.split(":", 1)[1]
+    tg_add_channel(u)
+    await cb.answer(f"Добавлен @{u} ✅")
+
+
+def _tgchannels_text() -> str:
+    env = [tg_parser._channel_username(c).lower() for c in tg_parser.TG_CHANNELS]
+    added = tg_get_channels()
+    lines = ["📡 <b>Каналы парсера</b>"]
+    if env:
+        lines.append("\nИз .env (меняются на Render):")
+        lines += [f"  • @{c}" for c in env]
+    if added:
+        lines.append("\nДобавленные (можно удалить кнопкой ниже):")
+        lines += [f"  • @{c}" for c in added]
+    if not env and not added:
+        lines.append("\nПока пусто. Найди каналы командой /discover.")
+    return "\n".join(lines)
+
+
+def _tgchannels_kb() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=f"🗑 @{c}", callback_data=f"tgdel:{c}")]
+            for c in tg_get_channels()]
+    rows.append([InlineKeyboardButton(text="🔎 Найти новые", callback_data="tgfind"),
+                 home_button()])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("tgchannels"))
+async def cmd_tgchannels(msg: Message):
+    await msg.answer(_tgchannels_text(), parse_mode="HTML",
+                     reply_markup=_tgchannels_kb(), disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data == "tgfind")
+async def cb_tgfind(cb: CallbackQuery):
+    await cb.answer("Ищу каналы…")
+    await run_discover(cb.message)
+
+
+@dp.callback_query(F.data.startswith("tgdel:"))
+async def cb_tgdel(cb: CallbackQuery):
+    u = cb.data.split(":", 1)[1]
+    tg_del_channel(u)
+    await cb.answer(f"Удалён @{u}")
+    try:
+        await cb.message.edit_text(_tgchannels_text(), parse_mode="HTML",
+                                   reply_markup=_tgchannels_kb(),
+                                   disable_web_page_preview=True)
+    except Exception:
+        pass
 
 
 # Подсказки для ForceReply — текст сравнивается точь-в-точь в on_force_reply,
@@ -1514,6 +1685,15 @@ async def on_document(msg: Message):
 
 _scan_lock = asyncio.Lock()   # один скан за раз: /check и poller не параллелятся
 
+# Живое состояние для кнопки/команды статуса: анализирует ли бот прямо сейчас,
+# когда был последний анализ и с каким результатом. Обновляется в process_candidates.
+_scan_status = {
+    "running": False,
+    "last_ts": "",       # ISO-время конца последнего анализа
+    "last_scanned": 0,   # сколько заказов оценено ИИ в последнем проходе
+    "last_passed": 0,    # сколько прошло фильтр
+}
+
 
 async def run_scan() -> int:
     if is_paused():
@@ -1533,31 +1713,39 @@ async def process_candidates(session, candidates: list[Job]) -> tuple[int, int, 
     scanned = 0
     passed = 0
     new_jobs: list[Job] = []
-    for job in candidates:
-        tk = title_key(job.title)
-        if is_seen(job.uid, tk):
-            continue
-        # пропускаем заказы старше MAX_JOB_AGE_HOURS (если время известно)
-        age = job.age_hours
-        if age is not None and age > MAX_JOB_AGE_HOURS:
-            continue
-        # антидубль/антиспам по автору: если он уже накидал MAX_PER_AUTHOR
-        # заказов за 12ч — пропускаем (один заказчик не должен заваливать ленту)
-        if job.author and author_recent_count(job.author) >= MAX_PER_AUTHOR:
+    _scan_status["running"] = True
+    try:
+        for job in candidates:
+            tk = title_key(job.title)
+            if is_seen(job.uid, tk):
+                continue
+            # пропускаем заказы старше MAX_JOB_AGE_HOURS (если время известно)
+            age = job.age_hours
+            if age is not None and age > MAX_JOB_AGE_HOURS:
+                continue
+            # антидубль/антиспам по автору: если он уже накидал MAX_PER_AUTHOR
+            # заказов за 12ч — пропускаем (один заказчик не должен заваливать ленту)
+            if job.author and author_recent_count(job.author) >= MAX_PER_AUTHOR:
+                mark_seen(job.uid, tk)
+                continue
             mark_seen(job.uid, tk)
-            continue
-        mark_seen(job.uid, tk)
-        scanned += 1
-        if not await evaluate(session, job):
-            continue
-        # скам-фильтр: высокий риск — режем
-        if job.scam_risk >= SCAM_THRESHOLD:
-            log.info("Скам-риск %d, пропускаю: %s", job.scam_risk, job.title[:50])
-            continue
-        passed += 1
-        mark_author(job.author)
-        log_job(job)
-        new_jobs.append(job)
+            scanned += 1
+            if not await evaluate(session, job):
+                continue
+            # скам-фильтр: высокий риск — режем
+            if job.scam_risk >= SCAM_THRESHOLD:
+                log.info("Скам-риск %d, пропускаю: %s", job.scam_risk, job.title[:50])
+                continue
+            passed += 1
+            mark_author(job.author)
+            log_job(job)
+            new_jobs.append(job)
+    finally:
+        # снимаем флаг и фиксируем итог даже если что-то упало в середине
+        _scan_status["running"] = False
+        _scan_status["last_ts"] = datetime.now(timezone.utc).isoformat()
+        _scan_status["last_scanned"] = scanned
+        _scan_status["last_passed"] = passed
     return scanned, passed, new_jobs
 
 
@@ -1615,6 +1803,25 @@ async def quiet_flush_loop():
                 await bot.send_message(CHAT_ID, f"☀️ За ночь накопилось заказов: {len(pend)}")
                 for job in sorted(pend, key=lambda j: j.score, reverse=True):
                     await send_card(job)
+
+
+async def discover_loop():
+    """Раз в TG_DISCOVER_DAYS бот сам ищет новые каналы и шлёт их на одобрение."""
+    if TG_DISCOVER_DAYS <= 0 or not tg_parser.tg_available():
+        return
+    while True:
+        await asyncio.sleep(TG_DISCOVER_DAYS * 86400)
+        try:
+            async with aiohttp.ClientSession() as s:
+                found = await tg_parser.discover(s, AI_PROXY)
+            if found:
+                text = ("🔎 <b>Авто-поиск нашёл новые каналы</b>\nДобавить?\n\n"
+                        + "\n".join(f"• @{u} — релевантность {sc}" for u, sc in found))
+                await bot.send_message(CHAT_ID, text, parse_mode="HTML",
+                                       disable_web_page_preview=True,
+                                       reply_markup=_discover_kb(found))
+        except Exception as e:
+            log.error("Авто-поиск каналов упал: %s", e)
 
 
 async def backup_loop():
@@ -1704,7 +1911,9 @@ async def main():
     # парсер Telegram-каналов — отдельной задачей в том же event loop
     if tg_parser.tg_available():
         asyncio.create_task(tg_parser.tg_poll_loop())
-        log.info("TG-парсер каналов включён (%d шт.)", len(tg_parser.TG_CHANNELS))
+        asyncio.create_task(discover_loop())
+        log.info("TG-парсер каналов включён (каналов: %d)",
+                 len(tg_parser.effective_channels()))
     while True:
         try:
             await dp.start_polling(bot, handle_signals=False,
