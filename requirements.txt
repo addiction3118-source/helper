@@ -3,4 +3,3 @@ aiohttp
 feedparser
 python-dotenv
 aiohttp_socks
-telethon

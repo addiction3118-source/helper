@@ -21,9 +21,8 @@ from aiogram.types import (
 )
 from aiogram.filters import Command
 
-# Парсер Telegram-каналов (userbot). Модуль самодостаточен и не тянет telethon
-# на импорте — если TG-парсер выключен или telethon не установлен, бот работает
-# как раньше, только по RSS.
+# Парсер Telegram-каналов через веб-превью t.me/s/ (без api_id/userbot).
+# Если TG-парсер выключен или TG_CHANNELS пуст — бот работает как раньше, по RSS.
 import tg_parser
 
 # ============================================================
