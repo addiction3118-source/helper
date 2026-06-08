@@ -1743,9 +1743,10 @@ async def process_candidates(session, candidates: list[Job]) -> tuple[int, int, 
             tk = title_key(job.title)
             if is_seen(job.uid, tk):
                 continue
-            # пропускаем заказы старше MAX_JOB_AGE_HOURS (если время известно)
+            # пропускаем заказы старше MAX_JOB_AGE_HOURS (если время известно).
+            # MAX_JOB_AGE_HOURS <= 0 — фильтр выключен, берём заказы любой давности.
             age = job.age_hours
-            if age is not None and age > MAX_JOB_AGE_HOURS:
+            if MAX_JOB_AGE_HOURS > 0 and age is not None and age > MAX_JOB_AGE_HOURS:
                 continue
             # антидубль/антиспам по автору: если он уже накидал MAX_PER_AUTHOR
             # заказов за 12ч — пропускаем (один заказчик не должен заваливать ленту)

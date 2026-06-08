@@ -35,8 +35,11 @@ TG_ENABLED = os.getenv("TG_ENABLED", "false").strip().lower() == "true"
 # Каналы через запятую: @distantsiya, https://t.me/forkwork, norm_rabota — всё ок
 TG_CHANNELS = [c.strip() for c in os.getenv("TG_CHANNELS", "").split(",") if c.strip()]
 TG_POLL_INTERVAL = _int("TG_POLL_INTERVAL", 300)   # как часто читать каналы, сек
-TG_FETCH_LIMIT = _int("TG_FETCH_LIMIT", 30)        # сколько последних постов брать на канал
+TG_FETCH_LIMIT = _int("TG_FETCH_LIMIT", 30)        # сколько последних постов брать на канал (на одну страницу)
 TG_MIN_LEN = _int("TG_MIN_LEN", 40)                # короче — это не заказ (отсев флуда)
+# Сколько страниц истории листать назад через ?before= (t.me/s/ отдаёт ~20 постов/стр).
+# 1 = только последние посты (как раньше). Больше = глубже в архив (для давних заказов).
+TG_HISTORY_PAGES = _int("TG_HISTORY_PAGES", 1)
 
 TG_DISCOVER_MIN_SCORE = _int("TG_DISCOVER_MIN_SCORE", 3)  # порог релевантности кандидата
 
@@ -120,7 +123,9 @@ def _parse_page(page: str, uname: str, max_age_hours: int) -> list:
     from main import Job, extract_budget, detect_lang
 
     jobs = []
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    # max_age_hours <= 0 — фильтр возраста выключен (берём посты любой давности)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+              if max_age_hours > 0 else None)
     # посты в HTML идут от старых к новым (новые внизу)
     for chunk in page.split(_MSG_SPLIT)[1:]:
         post = re.search(r'data-post="([^"]+)"', chunk)
@@ -137,7 +142,7 @@ def _parse_page(page: str, uname: str, max_age_hours: int) -> list:
         if tm:
             try:
                 dt = datetime.fromisoformat(tm.group(1)).astimezone(timezone.utc)
-                if dt < cutoff:
+                if cutoff is not None and dt < cutoff:
                     continue   # слишком старый пост — пропускаем
                 published_at = dt.isoformat()
             except Exception:
@@ -157,10 +162,14 @@ def _parse_page(page: str, uname: str, max_age_hours: int) -> list:
     return jobs[-TG_FETCH_LIMIT:]
 
 
-async def _fetch_page(session, uname: str, proxy, timeout: int = 30):
-    """Скачивает t.me/s/<uname>. Возвращает HTML, либо None если это не публичный канал."""
+async def _fetch_page(session, uname: str, proxy, timeout: int = 30, before=None):
+    """Скачивает t.me/s/<uname> (опц. ?before=<id> — страница истории до этого поста).
+    Возвращает HTML, либо None если это не публичный канал."""
+    url = f"https://t.me/s/{uname}"
+    if before:
+        url += f"?before={before}"
     try:
-        async with session.get(f"https://t.me/s/{uname}", proxy=proxy,
+        async with session.get(url, proxy=proxy,
                                headers={"User-Agent": "Mozilla/5.0"},
                                timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             page = await resp.text()
@@ -168,6 +177,12 @@ async def _fetch_page(session, uname: str, proxy, timeout: int = 30):
         log.warning("TG-парсер: не удалось загрузить %s: %s", uname, e)
         return None
     return page if _MSG_SPLIT in page else None   # нет постов → канал приватный/пустой/нет такого
+
+
+def _min_post_id(page: str) -> int | None:
+    """Наименьший id поста на странице — точка отсчёта для ?before= (страница глубже)."""
+    ids = [int(m) for m in re.findall(r'data-post="[^"/]+/(\d+)"', page)]
+    return min(ids) if ids else None
 
 
 def _page_text(page: str) -> str:
@@ -183,10 +198,19 @@ async def _fetch_channel(session, channel: str, max_age_hours: int, proxy) -> li
     if not uname or "joinchat" in channel or uname.startswith("+"):
         log.warning("TG-парсер: %s — приватный канал, веб-превью недоступно, пропускаю", channel)
         return []
-    page = await _fetch_page(session, uname, proxy)
-    if not page:
-        return []
-    return _parse_page(page, uname, max_age_hours)
+    # листаем историю на TG_HISTORY_PAGES страниц назад (?before=<min_id>).
+    # 1 страница = последние ~20 постов; больше — глубже в архив (давние заказы).
+    jobs, before = [], None
+    for _ in range(max(1, TG_HISTORY_PAGES)):
+        page = await _fetch_page(session, uname, proxy, before=before)
+        if not page:
+            break
+        jobs.extend(_parse_page(page, uname, max_age_hours))
+        mid = _min_post_id(page)
+        if mid is None or mid <= 1:
+            break          # дошли до начала канала
+        before = mid       # следующая итерация — посты старше этого id
+    return jobs
 
 
 async def _scan_once(process_candidates, dispatch_jobs, log_scan, scan_lock, max_age_hours):
