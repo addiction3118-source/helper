@@ -48,7 +48,13 @@ _MSG_SPLIT = '<div class="tgme_widget_message_wrap'
 # Только публичные broadcast-каналы с веб-превью (проверены живыми).
 # Невалидные/мёртвые в любом случае отсеются при проверке через t.me/s/.
 CURATED_SEEDS = [
+    # проверенные каналы с ЗАКАЗАМИ (прямой контакт, бесплатный отклик).
+    # Невалидные/мёртвые отсеются при проверке через t.me/s/.
     "forkwork", "remoteit", "it_freelancing",
+    "it_zakazy", "freelance_zakazy", "zakazi_freelance",
+    "rabota_freelancer", "nocodejobs",
+    # no-code биржи заказов (проверены: t.me/s/, поток заказов, не вакансии)
+    "zerocode_jobs", "nocode_jobs", "itjobs_nocode",
 ]
 
 # имя канала из @mention или t.me/-ссылки внутри поста
@@ -236,7 +242,7 @@ async def discover(session, proxy, max_suggest: int = 8) -> list:
 
     # 1. собираем кандидатов из постов базовых каналов
     found, seen = [], set(have)
-    for ch in base[:20]:
+    for ch in base[:30]:
         page = await _fetch_page(session, ch, proxy, timeout=20)
         if not page:
             continue
@@ -253,7 +259,7 @@ async def discover(session, proxy, max_suggest: int = 8) -> list:
 
     # 2. валидируем и оцениваем (это HTTP-запросы — ограничиваем число)
     scored = []
-    for u in found[:40]:
+    for u in found[:60]:
         page = await _fetch_page(session, u, proxy, timeout=20)
         if not page:
             continue

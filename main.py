@@ -88,6 +88,10 @@ POLL_INTERVAL = env_int("POLL_INTERVAL", 300)
 # Раз в столько дней бот сам ищет новые TG-каналы и присылает их на одобрение.
 # 0 = выключить авто-поиск (команда /discover всё равно работает вручную).
 TG_DISCOVER_DAYS = env_int("TG_DISCOVER_DAYS", 7)
+# Авто-добавление найденных каналов: при релевантности >= этого порога авто-поиск
+# подключает канал сам (с уведомлением), без кнопки. 0 = выключено (всё на одобрение).
+# Ставь высокий порог (напр. 15+), чтобы авто-добавлялись только явные биржи заказов.
+TG_AUTOADD_SCORE = env_int("TG_AUTOADD_SCORE", 0)
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").split("#", 1)[0].strip()
 # Прокси для запросов к ИИ. По умолчанию = TELEGRAM_PROXY (Groq/Gemini в РФ
 # блокируются по гео и отдают 403 — локально нужен иностранный прокси).
@@ -117,9 +121,9 @@ SOURCES = [
     # Weblancer отключён — отклики платные (нужен PRO)
     {"name": "Weblancer", "enabled": False,
      "url": "https://www.weblancer.net/rss/projects/"},
-    # FL.ru — отклик платный (PRO), но много заказов под вайбкодинг; включён,
-    # чтобы видеть заказы (откликаться можно с PRO или иначе)
-    {"name": "FL.ru", "enabled": True,
+    # FL.ru отключён — отклик платный (нужен PRO), смысла видеть заказы без
+    # возможности бесплатно откликнуться нет. Диверсификация — на TG-каналах.
+    {"name": "FL.ru", "enabled": False,
      "url": "https://www.fl.ru/rss/all.xml"},
     # Freelance.ru отключён — RSS убрали (отдаёт 404). Фид больше не работает.
     {"name": "Freelance.ru", "enabled": False,
@@ -1834,12 +1838,28 @@ async def discover_loop():
         try:
             async with aiohttp.ClientSession() as s:
                 found = await tg_parser.discover(s, AI_PROXY)
-            if found:
+            if not found:
+                continue
+            # авто-добавляем явные биржи (score >= порога), остальное — на одобрение
+            auto, suggest = [], []
+            for u, sc in found:
+                (auto if TG_AUTOADD_SCORE > 0 and sc >= TG_AUTOADD_SCORE
+                 else suggest).append((u, sc))
+            for u, _ in auto:
+                tg_add_channel(u)
+            if auto:
+                await bot.send_message(
+                    CHAT_ID,
+                    "✅ <b>Авто-поиск подключил каналы</b> (высокая релевантность):\n\n"
+                    + "\n".join(f"• @{u} — релевантность {sc}" for u, sc in auto)
+                    + "\n\nУбрать ненужные — /tgchannels.",
+                    parse_mode="HTML", disable_web_page_preview=True)
+            if suggest:
                 text = ("🔎 <b>Авто-поиск нашёл новые каналы</b>\nДобавить?\n\n"
-                        + "\n".join(f"• @{u} — релевантность {sc}" for u, sc in found))
+                        + "\n".join(f"• @{u} — релевантность {sc}" for u, sc in suggest))
                 await bot.send_message(CHAT_ID, text, parse_mode="HTML",
                                        disable_web_page_preview=True,
-                                       reply_markup=_discover_kb(found))
+                                       reply_markup=_discover_kb(suggest))
         except Exception as e:
             log.error("Авто-поиск каналов упал: %s", e)
 
