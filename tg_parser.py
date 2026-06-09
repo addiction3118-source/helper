@@ -37,9 +37,15 @@ TG_CHANNELS = [c.strip() for c in os.getenv("TG_CHANNELS", "").split(",") if c.s
 TG_POLL_INTERVAL = _int("TG_POLL_INTERVAL", 300)   # как часто читать каналы, сек
 TG_FETCH_LIMIT = _int("TG_FETCH_LIMIT", 30)        # сколько последних постов брать на канал (на одну страницу)
 TG_MIN_LEN = _int("TG_MIN_LEN", 40)                # короче — это не заказ (отсев флуда)
-# Сколько страниц истории листать назад через ?before= (t.me/s/ отдаёт ~20 постов/стр).
-# 1 = только последние посты (как раньше). Больше = глубже в архив (для давних заказов).
+# Глубина РАЗОВОГО первого скана канала (бэкафилл архива), страниц по ~20 постов.
+# Читается один раз при первом появлении канала в этом запуске бота, дальше — нет
+# смысла (дедуп). 0 = листать до самого начала канала (полный архив, тоже разово).
+TG_BACKFILL_PAGES = _int("TG_BACKFILL_PAGES", 50)
+# Глубина КАЖДОГО последующего скана (ловим новые посты сверху). 1 = только свежие.
 TG_HISTORY_PAGES = _int("TG_HISTORY_PAGES", 1)
+
+# каналы, чей архив уже разово прочитан в текущем запуске (бэкафилл сделан)
+_backfilled: set = set()
 
 TG_DISCOVER_MIN_SCORE = _int("TG_DISCOVER_MIN_SCORE", 3)  # порог релевантности кандидата
 
@@ -198,10 +204,15 @@ async def _fetch_channel(session, channel: str, max_age_hours: int, proxy) -> li
     if not uname or "joinchat" in channel or uname.startswith("+"):
         log.warning("TG-парсер: %s — приватный канал, веб-превью недоступно, пропускаю", channel)
         return []
-    # листаем историю на TG_HISTORY_PAGES страниц назад (?before=<min_id>).
-    # 1 страница = последние ~20 постов; больше — глубже в архив (давние заказы).
+    # Первый скан канала — глубокий бэкафилл архива (TG_BACKFILL_PAGES, 0=до начала).
+    # Последующие — мелкие (TG_HISTORY_PAGES): новые посты приходят сверху, перечитывать
+    # весь архив каждый цикл бессмысленно (дедуп) и грузит t.me/Render впустую.
+    if uname not in _backfilled:
+        pages = TG_BACKFILL_PAGES if TG_BACKFILL_PAGES > 0 else 10_000
+    else:
+        pages = max(1, TG_HISTORY_PAGES)
     jobs, before = [], None
-    for _ in range(max(1, TG_HISTORY_PAGES)):
+    for _ in range(pages):
         page = await _fetch_page(session, uname, proxy, before=before)
         if not page:
             break
@@ -210,6 +221,7 @@ async def _fetch_channel(session, channel: str, max_age_hours: int, proxy) -> li
         if mid is None or mid <= 1:
             break          # дошли до начала канала
         before = mid       # следующая итерация — посты старше этого id
+    _backfilled.add(uname)   # архив прочитан — дальше только свежие посты
     return jobs
 
 
