@@ -711,10 +711,22 @@ def _rotate_gemini_key() -> bool:
     return False
 
 
+class AIRateLimited(Exception):
+    """Все провайдеры ИИ исчерпаны по лимиту — оценка не состоялась (временно).
+    Заказ НЕ помечаем seen, чтобы вернуться к нему в следующем цикле."""
+
+
 def _is_rate_limit(e: Exception) -> bool:
-    """Похоже ли это на исчерпание лимита провайдера (429 / RESOURCE_EXHAUSTED)."""
-    s = str(e)
-    return "RESOURCE_EXHAUSTED" in s or "429" in s
+    """Похоже ли это на исчерпание лимита провайдера.
+
+    Разные провайдеры формулируют по-разному: Gemini — RESOURCE_EXHAUSTED/429,
+    Groq — rate_limit_exceeded / 'Rate limit reached', OpenAI — insufficient_quota.
+    Поэтому ловим по всем известным маркерам (без учёта регистра)."""
+    s = str(e).lower()
+    return any(k in s for k in (
+        "resource_exhausted", "429", "rate limit", "rate_limit",
+        "quota", "insufficient_quota", "too many requests",
+    ))
 
 
 def _provider_chain() -> list[str]:
@@ -763,9 +775,9 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
             raw = await _ai_with_fallback(session, ANALYZE_SYSTEM, msg, max_tokens=160)
     except Exception as e:
         if _is_rate_limit(e):
-            log.warning("Все провайдеры ИИ исчерпаны по лимиту — заказ пропускаю")
-        else:
-            log.warning("ИИ-анализ недоступен, заказ пропускаю: %s", e)
+            # временный лимит — не теряем заказ, дадим ему шанс в следующем цикле
+            raise AIRateLimited(str(e)) from e
+        log.warning("ИИ-анализ недоступен, заказ пропускаю: %s", e)
         return "no", 0
 
     txt = raw.strip().strip("`")
@@ -854,10 +866,11 @@ async def _call_openai(session, system, user_msg, max_tokens):
     async with session.post("https://api.openai.com/v1/chat/completions", headers=headers,
                             json=payload, proxy=AI_PROXY,
                             timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        status = resp.status
         data = await resp.json()
     if "choices" not in data:
         # показываем реальную причину (нет ключа / нет квоты / не та модель)
-        raise RuntimeError(f"OpenAI вернул ошибку: {data.get('error', data)}")
+        raise RuntimeError(f"OpenAI вернул ошибку (HTTP {status}): {data.get('error', data)}")
     return data["choices"][0]["message"]["content"].strip()
 
 
@@ -875,9 +888,10 @@ async def _call_gemini(session, system, user_msg, max_tokens):
     }
     async with session.post(url, headers=headers, json=payload, proxy=AI_PROXY,
                             timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        status = resp.status
         data = await resp.json()
     if "candidates" not in data:
-        raise RuntimeError(f"Gemini вернул ошибку: {data.get('error', data)}")
+        raise RuntimeError(f"Gemini вернул ошибку (HTTP {status}): {data.get('error', data)}")
     parts = data["candidates"][0].get("content", {}).get("parts", [])
     return "".join(p.get("text", "") for p in parts).strip()
 
@@ -890,9 +904,10 @@ async def _call_groq(session, system, user_msg, max_tokens):
     async with session.post("https://api.groq.com/openai/v1/chat/completions",
                             headers=headers, json=payload, proxy=AI_PROXY,
                             timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        status = resp.status
         data = await resp.json()
     if "choices" not in data:
-        raise RuntimeError(f"Groq вернул ошибку: {data.get('error', data)}")
+        raise RuntimeError(f"Groq вернул ошибку (HTTP {status}): {data.get('error', data)}")
     return data["choices"][0]["message"]["content"].strip()
 
 
@@ -1776,9 +1791,16 @@ async def process_candidates(session, candidates: list[Job]) -> tuple[int, int, 
             if job.author and author_recent_count(job.author) >= MAX_PER_AUTHOR:
                 mark_seen(job.uid, tk)
                 continue
-            mark_seen(job.uid, tk)
+            # оцениваем ДО mark_seen: при лимите ИИ заказ не теряем, вернёмся позже
+            try:
+                ok = await evaluate(session, job)
+            except AIRateLimited:
+                log.warning("Лимит всех ИИ-провайдеров — прерываю скан, "
+                            "необработанные заказы вернутся в следующем цикле")
+                break
+            mark_seen(job.uid, tk)   # оценка состоялась — теперь помечаем просмотренным
             scanned += 1
-            if not await evaluate(session, job):
+            if not ok:
                 continue
             # скам-фильтр: высокий риск — режем
             if job.scam_risk >= SCAM_THRESHOLD:
