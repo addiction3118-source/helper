@@ -674,11 +674,23 @@ ANALYZE_SYSTEM = (
 )
 
 DIFFICULTY_LABELS = {
-    "easy": "лёгкая — хватит вайбкодинга",
-    "medium": "средняя — вайбкодинг + доработка",
-    "hard": "сложная — нужна ручная разработка",
+    "easy": "🟢 чистый вайбкодинг",
+    "medium": "🟡 почти вайбкодинг (мелкая ручная правка)",
+    "hard": "🔴 ручная разработка (не вайбкодинг)",
 }
 RANK = {"easy": 1, "medium": 2, "hard": 3}
+
+# Понятное название ПОРОГА фильтра (MAX_DIFFICULTY = докуда пускать заказы).
+# Значения в настройках/env остаются easy/medium/hard — меняются только подписи.
+DIFF_FILTER_NAMES = {
+    "easy": "только чистый вайбкодинг 🟢",
+    "medium": "вайбкодинг + мелкая правка 🟡",
+    "hard": "всё, включая ручную разработку 🔴",
+}
+
+
+def diff_filter_name(value: str) -> str:
+    return DIFF_FILTER_NAMES.get(value, value)
 
 
 _ai_lock = asyncio.Lock()   # чтобы запросы к ИИ шли по одному
@@ -814,7 +826,7 @@ async def generate_reply(session, job: Job) -> str:
 async def estimate_earnings(session, job: Job) -> str:
     msg = (f"Заголовок: {job.title}\nОписание: {job.description[:1200]}\n"
            f"Бюджет заказчика: {job.budget or 'не указан'}\n"
-           f"Сложность по оценке ИИ: {job.difficulty or 'не оценена'}")
+           f"Тип задачи по оценке ИИ: {job.difficulty or 'не оценён'}")
     try:
         return await _ai_with_fallback(session, EARNINGS_SYSTEM, msg, max_tokens=450)
     except Exception as e:
@@ -984,7 +996,7 @@ def build_card(job: Job) -> tuple[str, InlineKeyboardMarkup]:
     if job.scam_risk >= 4:
         text += f"⚠️ Возможный скам (риск {job.scam_risk}/10)\n"
     if job.difficulty:
-        text += f"Сложность: {job.difficulty}\n"
+        text += f"Тип: {job.difficulty}\n"
     if job.budget:
         text += f"Бюджет: {html.escape(job.budget)}\n"
     # перевод/суть на русском от ИИ (если есть)
@@ -1065,7 +1077,7 @@ def commands_text() -> str:
         "Управляй кнопками ниже или командами:\n\n"
         "/check — проверить сейчас\n"
         "/status — что бот делает прямо сейчас\n"
-        "/settings — настройки (бюджет, сложность, тихие часы, пауза)\n"
+        "/settings — настройки (бюджет, тип заказов, тихие часы, пауза)\n"
         "/favorites — избранное\n"
         "/digest — сводка за 24 часа\n"
         "/stats — статистика\n"
@@ -1174,7 +1186,7 @@ async def cmd_difficulty(msg: Message):
     parts = msg.text.split()
     if len(parts) >= 2 and parts[1].lower() in ("easy", "medium", "hard"):
         set_setting("max_difficulty", parts[1].lower())
-        await msg.answer(f"Макс. сложность: {parts[1].lower()}", reply_markup=home_kb())
+        await msg.answer(f"Пускаю: {diff_filter_name(parts[1].lower())}", reply_markup=home_kb())
         return
     await msg.answer(_settings_text(), reply_markup=_settings_keyboard(),
                      parse_mode="HTML")
@@ -1470,7 +1482,7 @@ ASK_BUDGET = "Впиши минимальный бюджет в рублях (ч
 ASK_QUIET = "Впиши тихие часы: начало и конец через пробел (0–23). Пример: 23 8"
 
 BUDGET_PRESETS = [0, 1000, 3000, 5000]
-DIFF_BUTTONS = [("easy", "Лёгкая"), ("medium", "Средняя"), ("hard", "Сложная")]
+DIFF_BUTTONS = [("easy", "🟢 Вайбкодинг"), ("medium", "🟡 +правка"), ("hard", "🔴 Любые")]
 
 
 def _settings_keyboard() -> InlineKeyboardMarkup:
@@ -1506,7 +1518,7 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
 def _settings_text() -> str:
     return (
         "⚙️ <b>Настройки</b>\n\n"
-        f"Сложность: <b>{eff_max_difficulty()}</b>\n"
+        f"Что пускаю: <b>{diff_filter_name(eff_max_difficulty())}</b>\n"
         f"Мин. бюджет: <b>{eff_min_budget()} ₽</b>\n"
         f"Тихие часы: <b>{'вкл' if eff_quiet_enabled() else 'выкл'} "
         f"({eff_quiet_start():02d}:00–{eff_quiet_end():02d}:00)</b>\n"
@@ -1538,7 +1550,7 @@ async def cb_settings(cb: CallbackQuery):
 
     if action.startswith("d") and action[1:] in ("easy", "medium", "hard"):
         set_setting("max_difficulty", action[1:])
-        await cb.answer(f"Сложность: {action[1:]}")
+        await cb.answer(diff_filter_name(action[1:]))
     elif action.startswith("b") and action[1:].isdigit():
         set_setting("min_budget", int(action[1:]))
         await cb.answer(f"Бюджет: {action[1:]} ₽")
