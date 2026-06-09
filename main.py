@@ -341,6 +341,25 @@ def mark_seen(uid: str, t_key: str):
     conn.close()
 
 
+def seen_count() -> int:
+    conn = _conn()
+    n = conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+    conn.close()
+    return n
+
+
+def clear_seen() -> int:
+    """Чистит историю просмотров (только seen + счётчик авторов). Настройки,
+    избранное и каналы не трогаем. Возвращает, сколько записей было удалено."""
+    n = seen_count()
+    conn = _conn()
+    conn.execute("DELETE FROM seen")
+    conn.execute("DELETE FROM authors_seen")   # сбрасываем и антиспам-счётчик авторов
+    conn.commit()
+    conn.close()
+    return n
+
+
 def get_setting(key: str, default):
     conn = _conn()
     row = conn.execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
@@ -1102,6 +1121,7 @@ def commands_text() -> str:
         "/tgchannels — список каналов (добавить/удалить)\n"
         "/quiet — тихие часы\n"
         "/backup /restore — бэкап и восстановление базы\n"
+        "/recheck — сбросить историю и проверить заказы заново\n"
         "/pause /resume — пауза/возобновить"
     )
 
@@ -1205,6 +1225,31 @@ async def cmd_difficulty(msg: Message):
         return
     await msg.answer(_settings_text(), reply_markup=_settings_keyboard(),
                      parse_mode="HTML")
+
+
+@dp.message(Command("recheck"))
+async def cmd_recheck(msg: Message):
+    """Очистка истории просмотров (seen) — бот заново проверит и разошлёт заказы.
+    Требует подтверждения `/recheck yes`, чтобы случайно не запустить большой поток."""
+    parts = (msg.text or "").split()
+    if len(parts) >= 2 and parts[1].lower() in ("yes", "да", "confirm"):
+        n = clear_seen()
+        await msg.answer(
+            f"🧹 История просмотров очищена ({n} записей).\n"
+            f"Бот заново проверит источники в ближайшие сканы и разошлёт подходящие заказы. "
+            f"Это может занять время (ИИ по {AI_DELAY}с на заказ). Фолбэк на Gemini теперь рабочий.",
+            reply_markup=home_kb())
+        return
+    n = seen_count()
+    await msg.answer(
+        f"⚠️ <b>Сброс истории просмотров</b>\n"
+        f"Сейчас в базе {n} просмотренных заказов.\n\n"
+        f"После очистки бот заново проверит и разошлёт <b>весь доступный архив</b> "
+        f"(при MAX_JOB_AGE_HOURS=0 это много — будет большой поток карточек и заметная "
+        f"нагрузка на ИИ, возможен упор в лимит Groq).\n"
+        f"⚙️ Настройки, ⭐ избранное и 📡 каналы НЕ затрагиваются.\n\n"
+        f"Подтверди командой: <code>/recheck yes</code>",
+        parse_mode="HTML", reply_markup=home_kb())
 
 
 @dp.message(Command("pause"))
