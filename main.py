@@ -747,16 +747,25 @@ class AIRateLimited(Exception):
     Заказ НЕ помечаем seen, чтобы вернуться к нему в следующем цикле."""
 
 
-def _is_rate_limit(e: Exception) -> bool:
-    """Похоже ли это на исчерпание лимита провайдера.
+def _is_transient(e: Exception) -> bool:
+    """Временная ли это ошибка провайдера — стоит ли переключиться на резерв и
+    НЕ терять заказ (вернёмся к нему позже).
 
-    Разные провайдеры формулируют по-разному: Gemini — RESOURCE_EXHAUSTED/429,
-    Groq — rate_limit_exceeded / 'Rate limit reached', OpenAI — insufficient_quota.
-    Поэтому ловим по всем известным маркерам (без учёта регистра)."""
+    Сюда входят два класса:
+    1) исчерпание лимита: Gemini — RESOURCE_EXHAUSTED/429, Groq — rate_limit_exceeded /
+       'Rate limit reached', OpenAI — insufficient_quota;
+    2) временная недоступность модели: 503 UNAVAILABLE / 'high demand' / overloaded,
+       а также 500/502/504 и таймауты.
+    Постоянные ошибки (нет ключа, 400/401/403, кривая модель) сюда НЕ попадают —
+    их пробрасываем сразу, чтобы была видна настоящая причина."""
     s = str(e).lower()
     return any(k in s for k in (
+        # лимиты
         "resource_exhausted", "429", "rate limit", "rate_limit",
         "quota", "insufficient_quota", "too many requests",
+        # временная недоступность / перегрузка / серверные ошибки
+        "503", "500", "502", "504", "unavailable", "overloaded",
+        "high demand", "try again later", "temporarily", "timeout",
     ))
 
 
@@ -771,10 +780,12 @@ def _provider_chain() -> list[str]:
 
 
 async def _ai_with_fallback(session, system, user_msg, max_tokens) -> str:
-    """Запрос к ИИ с симметричным фолбэком: основной провайдер → резерв при лимите.
+    """Запрос к ИИ с симметричным фолбэком: основной провайдер → резерв при
+    временной ошибке (лимит или недоступность модели).
 
-    Для gemini внутри перебираются все доступные ключи. Не-лимитные ошибки
-    (нет ключа, кривая модель и т.п.) пробрасываются сразу — фолбэк только на 429.
+    Для gemini внутри перебираются все доступные ключи. Постоянные ошибки
+    (нет ключа, кривая модель и т.п.) пробрасываются сразу — фолбэк только на
+    временные (лимит/503/таймаут).
     """
     last_err: Exception | None = None
     for provider in _provider_chain():
@@ -782,7 +793,7 @@ async def _ai_with_fallback(session, system, user_msg, max_tokens) -> str:
             return await call_ai_provider(session, provider, system, user_msg, max_tokens)
         except Exception as e:
             last_err = e
-            if not _is_rate_limit(e):
+            if not _is_transient(e):
                 raise
             # gemini: до переключения на другой провайдер перебираем оставшиеся ключи
             if provider == "gemini":
@@ -791,9 +802,9 @@ async def _ai_with_fallback(session, system, user_msg, max_tokens) -> str:
                         return await call_ai_provider(session, "gemini", system, user_msg, max_tokens)
                     except Exception as e2:
                         last_err = e2
-                        if not _is_rate_limit(e2):
+                        if not _is_transient(e2):
                             raise
-            log.warning("Провайдер %s исчерпан по лимиту, перехожу на резерв…", provider)
+            log.warning("Провайдер %s недоступен (лимит/перегрузка), перехожу на резерв…", provider)
     raise last_err if last_err else RuntimeError("ИИ недоступен")
 
 
@@ -805,8 +816,8 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
             await asyncio.sleep(AI_DELAY)
             raw = await _ai_with_fallback(session, ANALYZE_SYSTEM, msg, max_tokens=160)
     except Exception as e:
-        if _is_rate_limit(e):
-            # временный лимит — не теряем заказ, дадим ему шанс в следующем цикле
+        if _is_transient(e):
+            # временная ошибка (лимит/перегрузка) — не теряем заказ, вернёмся позже
             raise AIRateLimited(str(e)) from e
         log.warning("ИИ-анализ недоступен, заказ пропускаю: %s", e)
         return "no", 0
