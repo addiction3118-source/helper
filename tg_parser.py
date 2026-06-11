@@ -180,7 +180,10 @@ async def _fetch_page(session, uname: str, proxy, timeout: int = 30, before=None
         async with session.get(url, proxy=proxy,
                                headers={"User-Agent": "Mozilla/5.0"},
                                timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            page = await resp.text()
+            # страница t.me/s/ — сотни КБ; читаем не больше лимита, чтобы
+            # аномально огромный ответ не уронил бота по памяти (Render 512 МБ)
+            from main import read_capped
+            page = await read_capped(resp)
     except Exception as e:
         log.warning("TG-парсер: не удалось загрузить %s: %s", uname, e)
         return None

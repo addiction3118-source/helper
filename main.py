@@ -736,11 +736,23 @@ def budget_to_number(budget: str) -> int:
     return val
 
 
+# Потолок размера ответа от внешних источников. Нормальный RSS — десятки/сотни КБ;
+# больше 5 МБ — это либо сбой, либо взломанная площадка пытается уронить бота
+# по памяти (на Render всего 512 МБ). Читаем не больше лимита и работаем с тем,
+# что успели получить.
+MAX_FETCH_BYTES = 5 * 1024 * 1024
+
+
+async def read_capped(resp, limit: int = MAX_FETCH_BYTES) -> str:
+    raw = await resp.content.read(limit)
+    return raw.decode(resp.charset or "utf-8", errors="replace")
+
+
 async def fetch_source(session: aiohttp.ClientSession, src: dict) -> list[Job]:
     jobs: list[Job] = []
     try:
         async with session.get(src["url"], timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            raw = await resp.text()
+            raw = await read_capped(resp)
     except Exception as e:
         log.warning("Не удалось загрузить %s: %s", src["name"], e)
         return jobs
