@@ -1171,6 +1171,12 @@ async def evaluate(session, job: Job) -> bool:
     """Решает, слать ли заказ. Заполняет job.difficulty, job.score, job.watched."""
     text = f"{job.title} {job.description}".lower()
 
+    # Kwork — отклик платный (коннекты), такие заказы владельцу не нужны.
+    # Режем и по тексту («kwork»/«кворк»), и по ссылке (kwork.ru) — TG-каналы
+    # часто репостят кворк-заказы без упоминания площадки в тексте.
+    if "kwork" in text or "кворк" in text or "kwork" in job.link.lower():
+        return False
+
     if any(bad in text for bad in BLACKLIST):
         return False
 
