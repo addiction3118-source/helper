@@ -73,6 +73,12 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 #   Mistral:    https://api.mistral.ai/v1       (бесплатный experiment-тариф)
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "").split("#", 1)[0].strip().rstrip("/")
                    or "https://api.openai.com/v1")
+# Для reasoning-моделей (gpt-oss на Cerebras): без ограничения «размышлений» модель
+# может потратить весь max_tokens на цепочку рассуждений и вернуть ПУСТОЙ ответ
+# (проверено живым запросом). Ставь "low". Пусто = параметр не отправляется
+# (обычные модели вроде gpt-4o-mini его не принимают).
+OPENAI_REASONING_EFFORT = (os.getenv("OPENAI_REASONING_EFFORT", "")
+                           .split("#", 1)[0].strip().lower())
 # Кастомный URL может работать БЕЗ ключа (локальная Ollama, публичный шлюз
 # Pollinations) — тогда OPENAI_API_KEY можно не задавать вовсе.
 OPENAI_IS_CUSTOM = OPENAI_BASE_URL != "https://api.openai.com/v1"
@@ -963,7 +969,10 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
     try:
         async with _ai_lock:
             await _ai_throttle()
-            raw = await _ai_with_fallback(session, ANALYZE_SYSTEM, msg, max_tokens=160)
+            # 400, а не 160: reasoning-модели (gpt-oss на Cerebras) тратят часть
+            # бюджета на размышления; обычным моделям запас не вредит — они
+            # останавливаются на конце JSON и лишнего не генерируют
+            raw = await _ai_with_fallback(session, ANALYZE_SYSTEM, msg, max_tokens=400)
     except Exception as e:
         if _is_transient(e):
             # временная ошибка (лимит/перегрузка) — не теряем заказ, вернёмся позже
@@ -1064,6 +1073,8 @@ async def _call_openai(session, system, user_msg, max_tokens):
     payload = {"model": OPENAI_MODEL, "max_tokens": max_tokens,
                "messages": [{"role": "system", "content": system},
                             {"role": "user", "content": user_msg}]}
+    if OPENAI_REASONING_EFFORT:
+        payload["reasoning_effort"] = OPENAI_REASONING_EFFORT
     async with session.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers,
                             json=payload, proxy=AI_PROXY,
                             timeout=aiohttp.ClientTimeout(total=60)) as resp:
