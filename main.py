@@ -934,16 +934,27 @@ def _provider_chain() -> list[str]:
     return chain
 
 
+# Провайдер, словивший лимит/перегрузку, отдыхает N секунд — без этого бот
+# каждые AI_DELAY секунд заново стучался в исчерпанный Groq (лишний запрос,
+# лишние 1-2 секунды на заказ и спам в логе) вместо сразу рабочего резерва.
+_provider_cooldown: dict[str, float] = {}   # провайдер -> monotonic, до которого пропускаем
+AI_COOLDOWN_SEC = 300
+
+
 async def _ai_with_fallback(session, system, user_msg, max_tokens) -> str:
     """Запрос к ИИ с симметричным фолбэком: основной провайдер → резерв при
     временной ошибке (лимит или недоступность модели).
 
     Для gemini внутри перебираются все доступные ключи. Постоянные ошибки
     (нет ключа, кривая модель и т.п.) пробрасываются сразу — фолбэк только на
-    временные (лимит/503/таймаут).
+    временные (лимит/503/таймаут). Провайдер после временной ошибки уходит в
+    кулдаун; если в кулдауне ВСЕ — пробуем всех (вдруг лимит уже отпустило).
     """
     last_err: Exception | None = None
-    for provider in _provider_chain():
+    now = time.monotonic()
+    chain = _provider_chain()
+    active = [p for p in chain if _provider_cooldown.get(p, 0) <= now] or chain
+    for provider in active:
         try:
             return await call_ai_provider(session, provider, system, user_msg, max_tokens)
         except Exception as e:
@@ -959,7 +970,9 @@ async def _ai_with_fallback(session, system, user_msg, max_tokens) -> str:
                         last_err = e2
                         if not _is_transient(e2):
                             raise
-            log.warning("Провайдер %s недоступен (лимит/перегрузка), перехожу на резерв…", provider)
+            _provider_cooldown[provider] = time.monotonic() + AI_COOLDOWN_SEC
+            log.warning("Провайдер %s недоступен (лимит/перегрузка) — пауза %d мин, иду на резерв…",
+                        provider, AI_COOLDOWN_SEC // 60)
     raise last_err if last_err else RuntimeError("ИИ недоступен")
 
 
