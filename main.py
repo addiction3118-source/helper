@@ -66,6 +66,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Провайдер "openai" умеет работать с ЛЮБЫМ OpenAI-совместимым API — достаточно
+# подменить базовый URL. Примеры бесплатных:
+#   Cerebras:   https://api.cerebras.ai/v1      (модели llama, очень быстрые)
+#   OpenRouter: https://openrouter.ai/api/v1    (десятки моделей с суффиксом :free)
+#   Mistral:    https://api.mistral.ai/v1       (бесплатный experiment-тариф)
+OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "").split("#", 1)[0].strip().rstrip("/")
+                   or "https://api.openai.com/v1")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
@@ -904,12 +911,15 @@ def _is_transient(e: Exception) -> bool:
 
 
 def _provider_chain() -> list[str]:
-    """Основной провайдер первым, затем резерв (groq↔gemini), если ключ есть."""
+    """Основной провайдер первым, затем ВСЕ резервные, на которые есть ключ.
+    Резерв дешёвый: вызывается только при лимите/недоступности предыдущего."""
     chain = [AI_PROVIDER]
-    if AI_PROVIDER == "groq" and _gemini_keys:
-        chain.append("gemini")
-    elif AI_PROVIDER == "gemini" and GROQ_API_KEY:
-        chain.append("groq")
+    for p, has_key in (("groq", bool(GROQ_API_KEY)),
+                       ("gemini", bool(_gemini_keys)),
+                       ("openai", bool(OPENAI_API_KEY)),
+                       ("anthropic", bool(ANTHROPIC_API_KEY))):
+        if p != AI_PROVIDER and has_key:
+            chain.append(p)
     return chain
 
 
@@ -1049,7 +1059,7 @@ async def _call_openai(session, system, user_msg, max_tokens):
     payload = {"model": OPENAI_MODEL, "max_tokens": max_tokens,
                "messages": [{"role": "system", "content": system},
                             {"role": "user", "content": user_msg}]}
-    async with session.post("https://api.openai.com/v1/chat/completions", headers=headers,
+    async with session.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers,
                             json=payload, proxy=AI_PROXY,
                             timeout=aiohttp.ClientTimeout(total=60)) as resp:
         status = resp.status
