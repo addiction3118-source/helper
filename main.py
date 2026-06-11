@@ -73,6 +73,9 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 #   Mistral:    https://api.mistral.ai/v1       (бесплатный experiment-тариф)
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "").split("#", 1)[0].strip().rstrip("/")
                    or "https://api.openai.com/v1")
+# Кастомный URL может работать БЕЗ ключа (локальная Ollama, публичный шлюз
+# Pollinations) — тогда OPENAI_API_KEY можно не задавать вовсе.
+OPENAI_IS_CUSTOM = OPENAI_BASE_URL != "https://api.openai.com/v1"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
@@ -912,11 +915,13 @@ def _is_transient(e: Exception) -> bool:
 
 def _provider_chain() -> list[str]:
     """Основной провайдер первым, затем ВСЕ резервные, на которые есть ключ.
-    Резерв дешёвый: вызывается только при лимите/недоступности предыдущего."""
+    Резерв дешёвый: вызывается только при лимите/недоступности предыдущего.
+    Порядок резерва: openai-совместимый (Cerebras) раньше gemini — Gemini в
+    2026 чаще ловит перегрузки/географические причуды, держим его последним."""
     chain = [AI_PROVIDER]
     for p, has_key in (("groq", bool(GROQ_API_KEY)),
-                       ("gemini", bool(_gemini_keys)),
                        ("openai", bool(OPENAI_API_KEY)),
+                       ("gemini", bool(_gemini_keys)),
                        ("anthropic", bool(ANTHROPIC_API_KEY))):
         if p != AI_PROVIDER and has_key:
             chain.append(p)
