@@ -59,8 +59,9 @@ _MSG_SPLIT = '<div class="tgme_widget_message_wrap'
 CURATED_SEEDS = [
     # проверенные каналы с ЗАКАЗАМИ (прямой контакт, бесплатный отклик).
     # Невалидные/мёртвые отсеются при проверке через t.me/s/.
+    # freelance_zakazy убран: чистые репосты Kwork (отклик там платный).
     "forkwork", "remoteit", "it_freelancing",
-    "it_zakazy", "freelance_zakazy", "zakazi_freelance",
+    "it_zakazy", "zakazi_freelance",
     "rabota_freelancer", "nocodejobs",
     # no-code биржи заказов (проверены: t.me/s/, поток заказов, не вакансии)
     "zerocode_jobs", "nocode_jobs", "itjobs_nocode",
