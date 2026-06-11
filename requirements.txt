@@ -1,5 +1,9 @@
-aiogram
-aiohttp
-feedparser
-python-dotenv
-aiohttp_socks
+# Версии запинены по мажорным диапазонам: защита от внезапных breaking changes
+# и supply-chain-сюрпризов при деплое (Render ставит зависимости на каждый билд).
+aiogram>=3.13,<4
+aiohttp>=3.9,<4
+feedparser>=6.0,<7
+python-dotenv>=1.0,<2
+aiohttp_socks>=0.8,<1
+tzdata>=2024.1
+

@@ -134,7 +134,9 @@ def _parse_page(page: str, uname: str, max_age_hours: int) -> list:
               if max_age_hours > 0 else None)
     # посты в HTML идут от старых к новым (новые внизу)
     for chunk in page.split(_MSG_SPLIT)[1:]:
-        post = re.search(r'data-post="([^"]+)"', chunk)
+        # строго username/id: значение идёт в ссылку t.me/<...> и в HTML карточки,
+        # произвольные символы из атрибута туда попадать не должны
+        post = re.search(r'data-post="([A-Za-z0-9_]+/\d+)"', chunk)
         text_m = re.search(
             r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', chunk, re.S)
         if not post or not text_m:

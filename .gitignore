@@ -1,4 +1,4 @@
 .env
-seen.db
+seen.db*
 __pycache__/
 .vscode/
