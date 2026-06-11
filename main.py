@@ -971,8 +971,10 @@ async def _ai_with_fallback(session, system, user_msg, max_tokens) -> str:
                         if not _is_transient(e2):
                             raise
             _provider_cooldown[provider] = time.monotonic() + AI_COOLDOWN_SEC
-            log.warning("Провайдер %s недоступен (лимит/перегрузка) — пауза %d мин, иду на резерв…",
-                        provider, AI_COOLDOWN_SEC // 60)
+            # в лог — настоящая причина (обрезанная), иначе не отличить
+            # «кончился дневной лимит» от «сервер перегружен на минуту»
+            log.warning("Провайдер %s недоступен (%.200s) — пауза %d мин, иду на резерв…",
+                        provider, last_err, AI_COOLDOWN_SEC // 60)
     raise last_err if last_err else RuntimeError("ИИ недоступен")
 
 
