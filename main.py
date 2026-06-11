@@ -1371,35 +1371,30 @@ async def cb_fav(cb: CallbackQuery):
 
 def commands_text() -> str:
     return (
-        "Мониторю фриланс-биржи и шлю заказы под вайбкодинг.\n"
-        "Управляй кнопками ниже или командами:\n\n"
-        "/check — проверить сейчас\n"
-        "/status — что бот делает прямо сейчас\n"
-        "/settings — настройки (бюджет, тип заказов, тихие часы, пауза)\n"
-        "/favorites — избранное\n"
-        "/digest — сводка за 24 часа\n"
-        "/stats — статистика и заказы по площадкам\n"
-        "/activity — график активности по часам\n"
-        "/tg — статус парсера Telegram-каналов\n"
-        "/discover — найти новые каналы\n"
-        "/tgchannels — список каналов (добавить/удалить)\n"
-        "/quiet — тихие часы\n"
-        "/backup /restore — бэкап и восстановление базы\n"
-        "/recheck — сбросить историю и проверить заказы заново\n"
-        "/pause /resume — пауза/возобновить"
+        "Мониторю фриланс-биржи и Telegram-каналы, шлю заказы под вайбкодинг.\n\n"
+        "<b>Основное</b> — кнопки ниже, либо:\n"
+        "/check · /status · /settings · /favorites · /stats\n\n"
+        "<b>Каналы</b>\n"
+        "/tgchannels — список (добавить/удалить)\n"
+        "/discover — найти новые\n"
+        "/tg — статус парсера\n\n"
+        "<b>Реже нужно</b>\n"
+        "/digest — сводка 24ч · /activity — график по часам\n"
+        "/quiet — тихие часы · /pause /resume — пауза\n"
+        "/backup /restore — бэкап базы\n"
+        "/recheck — проверить всё заново"
     )
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
-    """Главное меню кнопками — то же, что команды, но без набора."""
+    """Главное меню: только то, что нужно каждый день. Активность и сводка —
+    кнопками внутри «Статистики», команды работают по-прежнему все."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔎 Проверить сейчас", callback_data="menu:check")],
         [InlineKeyboardButton(text="🟢 Статус", callback_data="menu:status"),
-         InlineKeyboardButton(text="Избранное", callback_data="menu:fav")],
-        [InlineKeyboardButton(text="Сводка 24ч", callback_data="menu:digest"),
-         InlineKeyboardButton(text="Статистика", callback_data="menu:stats")],
-        [InlineKeyboardButton(text="Активность", callback_data="menu:activity"),
          InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="⭐ Избранное", callback_data="menu:fav"),
+         InlineKeyboardButton(text="📊 Статистика", callback_data="menu:stats")],
     ])
 
 
@@ -1414,7 +1409,7 @@ def home_kb() -> InlineKeyboardMarkup:
 
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
-    await msg.answer(commands_text(), reply_markup=main_menu_kb())
+    await msg.answer(commands_text(), reply_markup=main_menu_kb(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("menu:"))
@@ -1424,9 +1419,11 @@ async def cb_menu(cb: CallbackQuery):
     if action == "home":
         await cb.answer()
         try:
-            await cb.message.edit_text(commands_text(), reply_markup=main_menu_kb())
+            await cb.message.edit_text(commands_text(), reply_markup=main_menu_kb(),
+                                       parse_mode="HTML")
         except Exception:
-            await cb.message.answer(commands_text(), reply_markup=main_menu_kb())
+            await cb.message.answer(commands_text(), reply_markup=main_menu_kb(),
+                                    parse_mode="HTML")
     elif action == "check":
         await cb.answer("Проверяю биржи…")
         n = await run_scan()
@@ -1623,6 +1620,9 @@ def _stats_view() -> tuple[str, InlineKeyboardMarkup]:
     rows = [[InlineKeyboardButton(text=f"{src} · {cnt}",
                                   callback_data=f"src:{src_key(src)}:0")]
             for src, cnt in counts[:10]]
+    # редкие экраны живут здесь, а не в главном меню
+    rows.append([InlineKeyboardButton(text="📈 Активность", callback_data="menu:activity"),
+                 InlineKeyboardButton(text="☀️ Сводка 24ч", callback_data="menu:digest")])
     rows.append([home_button()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
