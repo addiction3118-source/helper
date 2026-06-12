@@ -268,7 +268,7 @@ class Job:
     score: int = 0
     watched: bool = False
     published_at: str = ""   # ISO строка UTC, пустая если RSS не отдал время
-    ru_summary: str = ""     # краткий пересказ/перевод на русский от ИИ
+    ru_summary: str = ""     # план от ИИ: как собрать вайбкодингом и за сколько часов
     author: str = ""         # автор заказа (для антидубля)
     lang: str = ""           # язык описания: ru / en / other
     scam_risk: int = 0       # риск скама 0-10 (ставит ИИ)
@@ -928,8 +928,10 @@ def _provider_chain() -> list[str]:
     Порядок резерва: openai-совместимый (Cerebras) раньше gemini — Gemini в
     2026 чаще ловит перегрузки/географические причуды, держим его последним."""
     chain = [AI_PROVIDER]
+    # openai-совместимый резерв доступен и БЕЗ ключа, если URL кастомный
+    # (локальная Ollama, публичные шлюзы) — см. OPENAI_IS_CUSTOM
     for p, has_key in (("groq", bool(GROQ_API_KEY)),
-                       ("openai", bool(OPENAI_API_KEY)),
+                       ("openai", bool(OPENAI_API_KEY) or OPENAI_IS_CUSTOM),
                        ("gemini", bool(_gemini_keys)),
                        ("anthropic", bool(ANTHROPIC_API_KEY))):
         if p != AI_PROVIDER and has_key:
@@ -1087,7 +1089,11 @@ async def _call_anthropic(session, system, user_msg, max_tokens):
 
 
 async def _call_openai(session, system, user_msg, max_tokens):
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json"}
+    # пустой "Bearer " не шлём: часть шлюзов отвечает на него 401,
+    # а кастомные URL (Ollama и т.п.) работают вовсе без ключа
+    if OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
     payload = {"model": OPENAI_MODEL, "max_tokens": max_tokens,
                "messages": [{"role": "system", "content": system},
                             {"role": "user", "content": user_msg}]}
@@ -1580,10 +1586,19 @@ async def show_favorites(target):
     favs = list_favorites()
     if not favs:
         await target.answer("В избранном пока пусто.", reply_markup=home_kb()); return
-    text = "⭐ <b>Избранное</b>\n\n" + "\n\n".join(
-        f"• <b>{html.escape(j.title)}</b>\n{j.link}" for j in favs)
-    await target.answer(text[:4000], parse_mode="HTML", disable_web_page_preview=True,
-                        reply_markup=home_kb())
+    # бюджет до лимита Telegram в 4096: тупой срез text[:4000] мог разрезать
+    # HTML-тег посередине — Telegram отклонял всё сообщение целиком
+    parts = ["⭐ <b>Избранное</b>"]
+    used = len(parts[0])
+    for j in favs:
+        entry = f"• <b>{html.escape(j.title)}</b>\n{html.escape(j.link, quote=True)}"
+        if used + len(entry) + 2 > 3800:
+            parts.append("…")
+            break
+        parts.append(entry)
+        used += len(entry) + 2
+    await target.answer("\n\n".join(parts), parse_mode="HTML",
+                        disable_web_page_preview=True, reply_markup=home_kb())
 
 
 @dp.message(Command("favorites"))
@@ -2389,8 +2404,10 @@ async def digest_loop():
             if now_local().hour == DIGEST_HOUR:
                 today = now_local().date().isoformat()
                 if get_setting("last_digest", "") != today:
-                    set_setting("last_digest", today)
+                    # сначала отправить, потом пометить: иначе сбой отправки
+                    # (сеть/лимит) терял сводку за день безвозвратно
                     await send_digest()
+                    set_setting("last_digest", today)
                     prune_db()   # заодно ежедневная чистка устаревших записей
         except Exception as e:
             log.error("Ошибка утренней сводки: %s", e)
@@ -2427,9 +2444,14 @@ def check_config():
         problems.append("BOT_TOKEN пуст")
     if not CHAT_ID:
         problems.append("CHAT_ID пуст или 0")
+    # опечатка в провайдере иначе молча уходила в ветку OpenAI с чужим ключом
+    if AI_PROVIDER not in ("groq", "gemini", "openai", "anthropic"):
+        problems.append(f"AI_PROVIDER неизвестен: '{AI_PROVIDER}' "
+                        f"(допустимо: groq / gemini / openai / anthropic)")
     if AI_PROVIDER == "anthropic" and not ANTHROPIC_API_KEY:
         problems.append("ANTHROPIC_API_KEY пуст")
-    if AI_PROVIDER == "openai" and not OPENAI_API_KEY:
+    # для кастомного OPENAI_BASE_URL (Ollama и т.п.) ключ не обязателен
+    if AI_PROVIDER == "openai" and not (OPENAI_API_KEY or OPENAI_IS_CUSTOM):
         problems.append("OPENAI_API_KEY пуст")
     if AI_PROVIDER == "groq" and not GROQ_API_KEY:
         problems.append("GROQ_API_KEY пуст")
