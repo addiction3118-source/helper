@@ -975,6 +975,11 @@ async def _ai_with_fallback(session, system, user_msg, max_tokens) -> str:
     временные (лимит/503/таймаут). Провайдер после временной ошибки уходит в
     кулдаун; если в кулдауне ВСЕ — пробуем всех (вдруг лимит уже отпустило).
     """
+    global _gemini_key_index
+    # Каждый запрос начинаем с первого Gemini-ключа: иначе индекс, доехавший до
+    # последнего ключа при прошлом исчерпании лимита, так и оставался на нём —
+    # и после кулдауна бот дёргал заведомо исчерпанный ключ вместо свежего первого.
+    _gemini_key_index = 0
     last_err: Exception | None = None
     now = time.monotonic()
     chain = _provider_chain()
@@ -1003,6 +1008,30 @@ async def _ai_with_fallback(session, system, user_msg, max_tokens) -> str:
     raise last_err if last_err else RuntimeError("ИИ недоступен")
 
 
+# Постоянный сбой ИИ (битый ключ и т.п.) повторяется на каждом заказе каждого
+# скана — без троттлинга владелец получил бы шквал одинаковых алертов. Шлём не
+# чаще раза в час; бот при этом заказы не теряет (они ждут следующего цикла).
+_last_ai_alert = 0.0
+
+
+async def _alert_owner_ai_down(err: str):
+    global _last_ai_alert
+    now = time.monotonic()
+    if now - _last_ai_alert < 3600:
+        return
+    _last_ai_alert = now
+    try:
+        await bot.send_message(
+            CHAT_ID,
+            "⚠️ <b>ИИ-анализ не работает</b> (постоянная ошибка, не лимит):\n"
+            f"<code>{html.escape(err[:300])}</code>\n\n"
+            "Заказы не теряются — вернусь к ним, как только ИИ заработает. "
+            "Проверь ключ/модель в настройках провайдера.",
+            parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        log.warning("Не удалось отправить алерт о сбое ИИ: %s", e)
+
+
 async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int]:
     msg = (f"<<<JOB>>>\nЗаголовок: {job.title}\nОписание: {job.description[:800]}\n"
            f"Бюджет: {job.budget or 'не указан'}\n<<<END>>>")
@@ -1017,8 +1046,14 @@ async def ai_analyze(session: aiohttp.ClientSession, job: Job) -> tuple[str, int
         if _is_transient(e):
             # временная ошибка (лимит/перегрузка) — не теряем заказ, вернёмся позже
             raise AIRateLimited(str(e)) from e
-        log.warning("ИИ-анализ недоступен, заказ пропускаю: %s", e)
-        return "no", 0
+        # Постоянная ошибка (неверный ключ, кривая модель, 401/403). РАНЬШЕ тут
+        # возвращали "no" — и process_candidates помечал заказ просмотренным,
+        # навсегда теряя его, причём молча. Теперь заказ НЕ теряем (тот же путь,
+        # что у лимита: вернёмся к нему в следующем цикле) и раз в час шлём
+        # владельцу алерт, чтобы он починил ключ, а не сидел в тишине.
+        log.error("ИИ-анализ: постоянная ошибка, прерываю скан: %s", e)
+        await _alert_owner_ai_down(str(e))
+        raise AIRateLimited(str(e)) from e
 
     txt = raw.strip().strip("`")
     txt = re.sub(r"^json", "", txt, flags=re.IGNORECASE).strip()
@@ -2344,19 +2379,33 @@ async def poller():
 
 
 async def quiet_flush_loop():
-    """Когда тихие часы закончились — отправляем накопленное пачкой."""
+    """Когда тихие часы закончились — отправляем накопленное пачкой.
+
+    Шапку «За ночь накопилось…» шлём ОДИН раз — в момент выхода из тихих часов.
+    Раньше она уходила каждые 60с, пока в очереди что-то оставалось: один
+    непрошедший send_card (сеть/лимит) превращался в бесконечный спам шапкой.
+    Заодно дневные недоставленные заказы (их кладёт в pending dispatch_jobs при
+    сбое отправки) теперь дошлются тихо, без вводящего в заблуждение «За ночь»."""
+    was_quiet = in_quiet_hours()
     while True:
         await asyncio.sleep(60)
         try:
-            if not in_quiet_hours():
-                pend = list_pending()
-                if pend:
-                    await bot.send_message(CHAT_ID, f"☀️ За ночь накопилось заказов: {len(pend)}")
-                    for job in sorted(pend, key=lambda j: j.score, reverse=True):
-                        # удаляем из очереди только после успешной отправки:
-                        # при сбое посреди пачки остаток уйдёт в следующей итерации
-                        if await send_card(job):
-                            delete_pending(job.uid)
+            quiet_now = in_quiet_hours()
+            just_woke = was_quiet and not quiet_now   # переход тихие→рабочие часы
+            was_quiet = quiet_now
+            if quiet_now:
+                continue
+            pend = list_pending()
+            if not pend:
+                continue
+            # шапку — только при пробуждении после тихих часов (одноразово)
+            if just_woke:
+                await bot.send_message(CHAT_ID, f"☀️ За ночь накопилось заказов: {len(pend)}")
+            for job in sorted(pend, key=lambda j: j.score, reverse=True):
+                # удаляем из очереди только после успешной отправки:
+                # при сбое посреди пачки остаток уйдёт в следующей итерации
+                if await send_card(job):
+                    delete_pending(job.uid)
         except Exception as e:
             log.error("Ошибка отправки накопленных заказов: %s", e)
 
